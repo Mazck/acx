@@ -1,0 +1,77 @@
+{
+  "prefix": "!",
+  "adminBot": ["YOUR_FACEBOOK_USER_ID"],
+  "language": "en",
+  "database": {
+    "type": "sqlite",
+    "path": "./data/database.sqlite",
+    "autoSync": true
+  },
+  "facebook": {
+    "email": "",
+    "password": "",
+    "appState": "./appstate.json",
+    "userAgent": "Mozilla/5.0 (Linux; Android 12; M2102J20SG) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.0.0 Mobile Safari/537.36",
+    "options": {
+      "forceLogin": true,
+      "listenEvents": true,
+      "logLevel": "error",
+      "selfListen": false,
+      "updatePresence": false,
+      "autoMarkDelivery": false,
+      "autoReconnect": true
+    }
+  },
+  "payos": {
+    "enable": false,
+    "clientId": "",
+    "apiKey": "",
+    "checksumKey": "",
+    "webhookUrl": "",
+    "packages": {
+      "basic": {
+        "name": "Basic Package",
+        "price": 10000,
+        "days": 30,
+        "description": "Basic bot features for 30 days"
+      },
+      "premium": {
+        "name": "Premium Package", 
+        "price": 25000,
+        "days": 90,
+        "description": "Premium bot features for 90 days"
+      }
+    }
+  },
+  "features": {
+    "autoRestart": false,
+    "antiInbox": false,
+    "dashboard": false,
+    "autoLoadScripts": true
+  },
+  "ai": {
+    "enable": true,
+    "apiKey": "YOUR_GEMINI_API_KEY",
+    "model": "gemini-pro",
+    "autoRespond": true,
+    "triggers": ["ai", "uranus", "bot"]
+  },
+  "security": {
+    "rateLimiting": {
+      "enable": true,
+      "maxRequests": 20,
+      "windowMs": 60000
+    },
+    "whitelist": {
+      "enable": false,
+      "userIDs": [],
+      "threadIDs": []
+    }
+  },
+  "logging": {
+    "level": "info",
+    "saveToFile": true,
+    "maxFileSize": "10MB",
+    "maxFiles": 5
+  }
+}

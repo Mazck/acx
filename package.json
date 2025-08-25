@@ -1,0 +1,55 @@
+{
+  "name": "uranus-bot",
+  "version": "2.0.0",
+  "description": "Uranus Bot - A modern TypeScript chatbot for Facebook Messenger",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:prod": "NODE_ENV=production node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "watch": "tsx watch src/index.ts",
+    "setup": "tsx setup.ts",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "clean": "rm -rf dist",
+    "build:clean": "npm run clean && npm run build",
+    "test": "echo \"Tests not implemented yet\"",
+    "migration": "tsx scripts/migrate.ts"
+  },
+  "keywords": ["bot", "facebook", "messenger", "typescript"],
+  "author": "Uranus Bot Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@dongdev/fca-unofficial": "^1.0.20",
+    "@google/generative-ai": "^0.24.1",
+    "@payos/node": "^1.0.10",
+    "axios": "^1.7.2",
+    "bcrypt": "^5.1.0",
+    "canvas": "^2.11.2",
+    "chalk": "^4.1.2",
+    "cheerio": "^1.0.0-rc.12",
+    "express": "^4.19.2",
+    "fs-extra": "^11.2.0",
+    "lodash": "^4.17.21",
+    "moment-timezone": "^0.5.45",
+    "sequelize": "^6.37.3",
+    "sqlite3": "^5.1.6",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "^5.0.2",
+    "@types/express": "^4.17.21",
+    "@types/fs-extra": "^11.0.4",
+    "@types/lodash": "^4.17.4",
+    "@types/node": "^20.12.12",
+    "@typescript-eslint/eslint-plugin": "^7.10.0",
+    "@typescript-eslint/parser": "^7.10.0",
+    "eslint": "^8.57.0",
+    "tsx": "^4.10.5",
+    "typescript": "^5.4.5"
+  }
+}
