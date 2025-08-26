@@ -18,6 +18,12 @@ export class UranusBot extends EventEmitter {
   private listening: any = null;
   private startTime: number;
 
+  // Add caching to prevent excessive API calls
+  private apiInfoCache = new Map<string, { data: any; timestamp: number }>();
+  private readonly CACHE_DURATION = 10 * 60 * 1000; // 10 minutes cache
+  private readonly MIN_API_INTERVAL = 2000; // Minimum 2 seconds between same API calls
+  private lastAPICall = new Map<string, number>();
+
   constructor(config: BotConfig) {
     super();
     this.config = config;
@@ -247,7 +253,7 @@ export class UranusBot extends EventEmitter {
     return true;
   }
 
-  // Enhanced ensureDataExists with better error handling
+  // Enhanced ensureDataExists with optimized API calls
   private async ensureDataExists(event: Event): Promise<void> {
     if (!this.database) {
       Logger.warn('EVENT', 'Database not initialized');
@@ -276,28 +282,29 @@ export class UranusBot extends EventEmitter {
     }
   }
 
-  // Ensure thread exists with comprehensive data
+  // Optimized thread creation with smart API calls
   private async ensureThreadExists(threadID: string, event: Event): Promise<void> {
     try {
       let thread = await this.database!.threads.get(threadID);
 
       if (!thread) {
-        // Get thread info from Facebook API if possible
+        Logger.info('THREAD_CREATION', `Creating missing thread: ${threadID}`);
+
+        // Use cached info or event data first, only call API if really needed
         let threadInfo: any = {};
 
-        try {
-          if (this.api && this.api.getThreadInfo) {
-            threadInfo = await this.api.getThreadInfo(threadID);
-            Logger.debug('THREAD_CREATION', 'Retrieved thread info from API', {
-              threadID,
-              threadName: threadInfo.threadName
-            });
-          }
-        } catch (apiError: any) {
-          Logger.warn('THREAD_CREATION', 'Could not get thread info from API', {
-            threadID,
-            error: apiError.message
-          });
+        // Try to use data from event first
+        if (event.threadName || event.participantIDs || event.adminIDs) {
+          threadInfo = {
+            threadName: event.threadName,
+            participantIDs: event.participantIDs,
+            adminIDs: event.adminIDs || []
+          };
+
+          Logger.debug('THREAD_CREATION', 'Using thread info from event data');
+        } else {
+          // Only call API if event doesn't have basic info AND not recently called
+          threadInfo = await this.getThreadInfoSafe(threadID);
         }
 
         const threadData = {
@@ -325,15 +332,15 @@ export class UranusBot extends EventEmitter {
 
         thread = await this.database!.threads.create(threadID, threadData);
 
-        Logger.info('THREAD_CREATION', `Created new thread: ${threadID}`, {
+        Logger.success('THREAD_CREATION', `Created new thread: ${threadID}`, {
           threadName: threadData.threadName,
           isGroup: threadData.isGroup,
           memberCount: threadData.members.length
         });
       }
 
-      // Update thread activity
-      if (thread) {
+      // Update thread activity (lightweight operation)
+      if (thread && event.type === 'message') {
         await this.database!.threads.set(threadID, { isActive: true }, 'isActive');
       }
 
@@ -343,29 +350,24 @@ export class UranusBot extends EventEmitter {
     }
   }
 
-  // Ensure user exists with comprehensive data
+  // Optimized user creation with smart API calls
   private async ensureUserExists(senderID: string, event: Event): Promise<void> {
     try {
       let user = await this.database!.users.get(senderID);
 
       if (!user) {
-        // Get user info from Facebook API if possible
+        Logger.info('USER_CREATION', `Creating missing user: ${senderID}`);
+
+        // Use cached info or event data first
         let userInfo: any = {};
 
-        try {
-          if (this.api && this.api.getUserInfo) {
-            const userInfoResponse = await this.api.getUserInfo(senderID);
-            userInfo = userInfoResponse[senderID] || {};
-            Logger.debug('USER_CREATION', 'Retrieved user info from API', {
-              senderID,
-              name: userInfo.name
-            });
-          }
-        } catch (apiError: any) {
-          Logger.warn('USER_CREATION', 'Could not get user info from API', {
-            senderID,
-            error: apiError.message
-          });
+        // Try to use data from event first
+        if (event.senderName) {
+          userInfo = { name: event.senderName };
+          Logger.debug('USER_CREATION', 'Using user info from event data');
+        } else {
+          // Only call API if event doesn't have basic info
+          userInfo = await this.getUserInfoSafe(senderID);
         }
 
         // Create user with available data
@@ -380,7 +382,7 @@ export class UranusBot extends EventEmitter {
 
         user = await this.database!.users.create(senderID, userData);
 
-        Logger.info('USER_CREATION', `Created new user: ${senderID}`, {
+        Logger.success('USER_CREATION', `Created new user: ${senderID}`, {
           name: userData.name
         });
       }
@@ -388,6 +390,123 @@ export class UranusBot extends EventEmitter {
     } catch (error) {
       Logger.error('USER_CREATION', `Failed to ensure user ${senderID}`, error);
       // Don't throw for user creation failures - thread is more important
+    }
+  }
+
+  // Safe API call with caching and rate limiting
+  private async getThreadInfoSafe(threadID: string): Promise<any> {
+    const cacheKey = `thread_${threadID}`;
+    const now = Date.now();
+
+    // Check cache first
+    const cached = this.apiInfoCache.get(cacheKey);
+    if (cached && (now - cached.timestamp) < this.CACHE_DURATION) {
+      Logger.debug('API_CACHE', `Using cached thread info for ${threadID}`);
+      return cached.data;
+    }
+
+    // Check rate limiting
+    const lastCall = this.lastAPICall.get(cacheKey) || 0;
+    if ((now - lastCall) < this.MIN_API_INTERVAL) {
+      Logger.debug('API_LIMIT', `Rate limited getThreadInfo for ${threadID}`);
+      return {}; // Return empty object to avoid blocking
+    }
+
+    try {
+      Logger.debug('API_CALL', `Fetching thread info for ${threadID}`);
+      this.lastAPICall.set(cacheKey, now);
+
+      const threadInfo = await Promise.race([
+        this.api.getThreadInfo(threadID),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('API timeout')), 5000))
+      ]);
+
+      // Cache the result
+      this.apiInfoCache.set(cacheKey, {
+        data: threadInfo,
+        timestamp: now
+      });
+
+      Logger.debug('API_SUCCESS', `Got thread info for ${threadID}`);
+      return threadInfo;
+    } catch (error: any) {
+      Logger.warn('API_ERROR', `Could not get thread info for ${threadID}: ${error.message}`);
+
+      // Cache empty result to prevent repeated failures
+      this.apiInfoCache.set(cacheKey, {
+        data: {},
+        timestamp: now
+      });
+
+      return {};
+    }
+  }
+
+  // Safe API call with caching and rate limiting for user info
+  private async getUserInfoSafe(userID: string): Promise<any> {
+    const cacheKey = `user_${userID}`;
+    const now = Date.now();
+
+    // Check cache first
+    const cached = this.apiInfoCache.get(cacheKey);
+    if (cached && (now - cached.timestamp) < this.CACHE_DURATION) {
+      Logger.debug('API_CACHE', `Using cached user info for ${userID}`);
+      return cached.data;
+    }
+
+    // Check rate limiting
+    const lastCall = this.lastAPICall.get(cacheKey) || 0;
+    if ((now - lastCall) < this.MIN_API_INTERVAL) {
+      Logger.debug('API_LIMIT', `Rate limited getUserInfo for ${userID}`);
+      return {}; // Return empty object to avoid blocking
+    }
+
+    try {
+      Logger.debug('API_CALL', `Fetching user info for ${userID}`);
+      this.lastAPICall.set(cacheKey, now);
+
+      const userInfoResponse = await Promise.race([
+        this.api.getUserInfo(userID),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('API timeout')), 5000))
+      ]);
+
+      const userInfo = userInfoResponse[userID] || {};
+
+      // Cache the result
+      this.apiInfoCache.set(cacheKey, {
+        data: userInfo,
+        timestamp: now
+      });
+
+      Logger.debug('API_SUCCESS', `Got user info for ${userID}`);
+      return userInfo;
+    } catch (error: any) {
+      Logger.warn('API_ERROR', `Could not get user info for ${userID}: ${error.message}`);
+
+      // Cache empty result to prevent repeated failures
+      this.apiInfoCache.set(cacheKey, {
+        data: {},
+        timestamp: now
+      });
+
+      return {};
+    }
+  }
+
+  // Clean up old cache entries periodically
+  private cleanupCache(): void {
+    const now = Date.now();
+    for (const [key, value] of this.apiInfoCache.entries()) {
+      if ((now - value.timestamp) > this.CACHE_DURATION * 2) {
+        this.apiInfoCache.delete(key);
+      }
+    }
+
+    // Clean up rate limit tracking
+    for (const [key, timestamp] of this.lastAPICall.entries()) {
+      if ((now - timestamp) > this.MIN_API_INTERVAL * 10) {
+        this.lastAPICall.delete(key);
+      }
     }
   }
 
@@ -479,7 +598,6 @@ export class UranusBot extends EventEmitter {
     return true;
   }
 
-  // Fix: Add validateEvent method
   private validateEvent(event: any): boolean {
     if (!event || !event.config) {
       Logger.error('EVENT', 'Event missing config');
@@ -525,6 +643,11 @@ export class UranusBot extends EventEmitter {
 
       Logger.info('AUTO_RELOAD', 'Auto-reload enabled');
     }
+
+    // Setup cache cleanup interval (every 5 minutes)
+    setInterval(() => {
+      this.cleanupCache();
+    }, 5 * 60 * 1000);
   }
 
   private async reloadCommand(filename: string): Promise<void> {
@@ -574,7 +697,6 @@ export class UranusBot extends EventEmitter {
     process.exit(2);
   }
 
-  // Fix: Add cleanup method
   async cleanup(): Promise<void> {
     Logger.info('CLEANUP', 'Cleaning up resources...');
 
@@ -583,6 +705,10 @@ export class UranusBot extends EventEmitter {
         this.api.stopListening();
         this.listening = null;
       }
+
+      // Clear caches
+      this.apiInfoCache.clear();
+      this.lastAPICall.clear();
 
       // Cleanup command manager
       this.commandManager.cleanup();
@@ -645,13 +771,15 @@ export class UranusBot extends EventEmitter {
       database: boolean;
       listening: boolean;
       uptime: number;
+      cacheSize: number;
     };
   } {
     const details = {
       api: !!this.api,
       database: !!this.database,
       listening: !!this.listening,
-      uptime: this.getUptime()
+      uptime: this.getUptime(),
+      cacheSize: this.apiInfoCache.size
     };
 
     let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
@@ -672,13 +800,45 @@ export class UranusBot extends EventEmitter {
     events: number;
     threads: number;
     users: number;
+    cacheHits: number;
+    apiCalls: number;
   } {
     return {
       uptime: this.getUptime(),
       commands: this.commandManager.getStats().totalCommands,
       events: this.eventHandler.getEventCount(),
       threads: 0, // Will be populated by database query if needed
-      users: 0    // Will be populated by database query if needed
+      users: 0,   // Will be populated by database query if needed
+      cacheHits: this.apiInfoCache.size,
+      apiCalls: this.lastAPICall.size
+    };
+  }
+
+  // Method to manually clear API cache if needed
+  clearAPICache(): void {
+    this.apiInfoCache.clear();
+    this.lastAPICall.clear();
+    Logger.info('CACHE', 'API cache cleared manually');
+  }
+
+  // Method to get cache statistics
+  getCacheStats(): {
+    size: number;
+    oldestEntry: number;
+    newestEntry: number;
+  } {
+    let oldest = Date.now();
+    let newest = 0;
+
+    for (const entry of this.apiInfoCache.values()) {
+      if (entry.timestamp < oldest) oldest = entry.timestamp;
+      if (entry.timestamp > newest) newest = entry.timestamp;
+    }
+
+    return {
+      size: this.apiInfoCache.size,
+      oldestEntry: this.apiInfoCache.size > 0 ? oldest : 0,
+      newestEntry: this.apiInfoCache.size > 0 ? newest : 0
     };
   }
 }
