@@ -1,8 +1,9 @@
-// src/integrations/PayOSManager.ts
+// src/integrations/PayOSManager.ts - Enhanced version with SQL integration
 import PayOS from '@payos/node';
 import { Logger } from '../utils/Logger';
 import { Utils } from '../utils/Utils';
 import { DatabaseManager } from '../types/interfaces';
+import { EnhancedSQLiteDatabase } from '../database/providers/EnhancedSQLiteDatabase';
 
 export interface SubscriptionPlan {
     id: string;
@@ -11,10 +12,11 @@ export interface SubscriptionPlan {
     days: number;
     description: string;
     features: string[];
-    renewalDiscount?: number; // Phần trăm giảm giá khi gia hạn
+    renewalDiscount?: number;
 }
 
 export interface ThreadSubscription {
+    id: string;
     threadID: string;
     planId: string;
     startDate: Date;
@@ -24,6 +26,19 @@ export interface ThreadSubscription {
     renewalCount: number;
     lastPaymentDate: Date;
     features: string[];
+    isTrial: boolean;
+    createdBy: string;
+    history: SubscriptionHistory[];
+}
+
+export interface SubscriptionHistory {
+    action: 'activated' | 'renewed' | 'extended' | 'deactivated';
+    planId: string;
+    amount: number;
+    days: number;
+    promoCode?: string;
+    timestamp: Date;
+    orderCode?: number;
 }
 
 export interface PaymentData {
@@ -32,14 +47,20 @@ export interface PaymentData {
     description: string;
     threadID: string;
     planId: string;
+    userID: string;
     isRenewal: boolean;
-    originalAmount?: number; // Giá gốc trước khi giảm
-    discountAmount?: number; // Số tiền được giảm
+    originalAmount?: number;
+    discountAmount?: number;
+    promoCode?: string;
+    totalDays?: number;
+    status: 'pending' | 'success' | 'failed' | 'cancelled';
+    timestamp: Date;
+    metadata: Record<string, any>;
 }
 
 export class PayOSManager {
     private payos: PayOS;
-    private database: DatabaseManager;
+    private database: EnhancedSQLiteDatabase;
     private config: any;
     private subscriptionPlans: Map<string, SubscriptionPlan> = new Map();
 
@@ -61,7 +82,7 @@ export class PayOSManager {
             days: 30,
             description: 'Perfect for small groups',
             features: ['All basic commands', 'AI features', 'Economy system', 'Welcome messages'],
-            renewalDiscount: 10 // 10% giảm giá khi gia hạn
+            renewalDiscount: 10
         },
         {
             id: 'premium',
@@ -70,7 +91,7 @@ export class PayOSManager {
             days: 90,
             description: 'Best value for active groups',
             features: ['All commands', 'Advanced AI', 'Custom features', 'Priority support'],
-            renewalDiscount: 15 // 15% giảm giá khi gia hạn
+            renewalDiscount: 15
         },
         {
             id: 'vip',
@@ -79,11 +100,11 @@ export class PayOSManager {
             days: 180,
             description: 'Premium experience with exclusive features',
             features: ['All premium features', 'Custom commands', '24/7 support', 'Special badges'],
-            renewalDiscount: 20 // 20% giảm giá khi gia hạn
+            renewalDiscount: 20
         }
     ];
 
-    constructor(database: DatabaseManager, config: any) {
+    constructor(database: EnhancedSQLiteDatabase, config: any) {
         this.database = database;
         this.config = config;
 
@@ -93,15 +114,11 @@ export class PayOSManager {
                 config.payos.apiKey,
                 config.payos.checksumKey
             );
-
             Logger.info('PAYOS', 'PayOS initialized successfully');
         }
 
-        // Load subscription plans
         this.loadSubscriptionPlans();
-
-        // Setup periodic subscription checks
-        this.setupSubscriptionChecker();
+        this.setupPeriodicTasks();
     }
 
     private loadSubscriptionPlans(): void {
@@ -122,7 +139,6 @@ export class PayOSManager {
                     features: (packageInfo as any).features || [],
                     renewalDiscount: (packageInfo as any).renewalDiscount || 10
                 };
-
                 this.subscriptionPlans.set(id, plan);
             }
         }
@@ -157,31 +173,28 @@ export class PayOSManager {
     // Get thread subscription details
     async getThreadSubscription(threadID: string): Promise<ThreadSubscription | null> {
         try {
-            const subscription = await this.database.global.get(`subscription_${threadID}`);
-
-            if (!subscription) {
-                return null;
-            }
-
-            return {
-                ...subscription,
-                startDate: new Date(subscription.startDate),
-                endDate: new Date(subscription.endDate),
-                lastPaymentDate: new Date(subscription.lastPaymentDate)
-            };
+            return await this.database.getSubscriptionByThread(threadID);
         } catch (error) {
             Logger.error('PAYOS', 'Error getting subscription', error);
             return null;
         }
     }
 
-    // Create payment link for subscription
+    // Create payment link for subscription with promo code support
     async createSubscriptionPayment(
         threadID: string,
         planId: string,
-        userID: string
-    ): Promise<{ checkoutUrl: string; orderCode: number; amount: number; isRenewal: boolean }> {
-
+        userID: string,
+        promoCode?: string
+    ): Promise<{
+        checkoutUrl: string;
+        orderCode: number;
+        amount: number;
+        isRenewal: boolean;
+        promoApplied?: string;
+        discountAmount?: number;
+        bonusDays?: number;
+    }> {
         if (!this.payos) {
             throw new Error('PayOS not initialized');
         }
@@ -194,19 +207,60 @@ export class PayOSManager {
         const existingSubscription = await this.getThreadSubscription(threadID);
         const isRenewal = !!existingSubscription;
 
-        // Calculate price with renewal discount
         let finalAmount = plan.price;
         let discountAmount = 0;
+        let bonusDays = 0;
+        let appliedPromoCode = '';
 
+        // Apply renewal discount first
         if (isRenewal && plan.renewalDiscount && plan.renewalDiscount > 0) {
-            discountAmount = Math.floor(plan.price * (plan.renewalDiscount / 100));
-            finalAmount = plan.price - discountAmount;
+            const renewalDiscount = Math.floor(plan.price * (plan.renewalDiscount / 100));
+            finalAmount = plan.price - renewalDiscount;
+            discountAmount += renewalDiscount;
         }
 
-        // Free trial handling
-        if (plan.price === 0) {
-            await this.activateSubscription(threadID, planId, userID, 0, true);
-            throw new Error('TRIAL_ACTIVATED'); // Special case for trial
+        // Apply promo code if provided
+        if (promoCode) {
+            const promoManager = (global as any).bot.promoCodeManager;
+            if (promoManager) {
+                const promoResult = await promoManager.validateAndApplyPromoCode(
+                    promoCode, threadID, userID, planId, finalAmount
+                );
+
+                if (!promoResult.isValid) {
+                    throw new Error(promoResult.error);
+                }
+
+                if (promoResult.discountedPrice !== undefined) {
+                    const promoDiscount = finalAmount - promoResult.discountedPrice;
+                    finalAmount = promoResult.discountedPrice;
+                    discountAmount += promoDiscount;
+                }
+
+                if (promoResult.freeDays) {
+                    bonusDays = promoResult.freeDays;
+                }
+
+                appliedPromoCode = promoCode;
+            }
+        }
+
+        // Handle free activation
+        if (finalAmount === 0) {
+            await this.activateSubscription(
+                threadID, planId, userID, 0, plan.id === 'trial', bonusDays, appliedPromoCode
+            );
+
+            if (appliedPromoCode) {
+                const promoManager = (global as any).bot.promoCodeManager;
+                if (promoManager) {
+                    await promoManager.markPromoCodeUsed(
+                        appliedPromoCode, threadID, userID, plan.price, 0
+                    );
+                }
+            }
+
+            throw new Error('FREE_ACTIVATED');
         }
 
         const orderCode = this.generateOrderCode();
@@ -219,13 +273,23 @@ export class PayOSManager {
                 : `Đăng ký ${plan.name} cho nhóm ${threadID}`,
             threadID,
             planId,
+            userID,
             isRenewal,
             originalAmount: plan.price,
-            discountAmount: isRenewal ? discountAmount : 0
+            discountAmount,
+            promoCode: appliedPromoCode,
+            totalDays: plan.days + bonusDays,
+            status: 'pending',
+            timestamp: new Date(),
+            metadata: {
+                bonusDays,
+                renewalDiscount: isRenewal ? plan.renewalDiscount : 0,
+                features: plan.features
+            }
         };
 
-        // Store payment data for verification
-        await this.database.global.set(`payment_${orderCode}`, paymentData);
+        // Store payment data in database
+        await this.database.createTransaction(paymentData);
 
         const body = {
             orderCode,
@@ -233,13 +297,13 @@ export class PayOSManager {
             description: paymentData.description,
             items: [
                 {
-                    name: plan.name,
+                    name: plan.name + (bonusDays ? ` + ${bonusDays} bonus days` : ''),
                     quantity: 1,
                     price: finalAmount,
                 }
             ],
-            returnUrl: `${this.config.payos.webhookUrl}/payment/success`,
-            cancelUrl: `${this.config.payos.webhookUrl}/payment/cancel`
+            returnUrl: `${this.config.payos.webhookUrl}/payment/success?orderCode=${orderCode}`,
+            cancelUrl: `${this.config.payos.webhookUrl}/payment/cancel?orderCode=${orderCode}`
         };
 
         const paymentLinkResponse = await this.payos.createPaymentLink(body);
@@ -249,14 +313,19 @@ export class PayOSManager {
             amount: finalAmount,
             plan: plan.name,
             isRenewal,
-            discount: discountAmount
+            discount: discountAmount,
+            promoCode: appliedPromoCode,
+            bonusDays
         });
 
         return {
             checkoutUrl: paymentLinkResponse.checkoutUrl,
             orderCode,
             amount: finalAmount,
-            isRenewal
+            isRenewal,
+            promoApplied: appliedPromoCode,
+            discountAmount,
+            bonusDays
         };
     }
 
@@ -271,36 +340,65 @@ export class PayOSManager {
                 return false;
             }
 
-            // Get stored payment data
-            const paymentData = await this.database.global.get(`payment_${orderCode}`) as PaymentData;
+            // Get stored payment data from database
+            const transaction = await this.database.getTransactionByOrderCode(orderCode);
 
-            if (!paymentData) {
-                Logger.error('PAYOS', `Payment data not found for order ${orderCode}`);
+            if (!transaction) {
+                Logger.error('PAYOS', `Transaction not found for order ${orderCode}`);
                 return false;
             }
 
+            // Update transaction status
+            await this.database.updateTransactionStatus(orderCode, 'success', new Date());
+
+            // Calculate bonus days
+            const bonusDays = transaction.totalDays
+                ? transaction.totalDays - this.subscriptionPlans.get(transaction.planId)!.days
+                : 0;
+
             // Activate subscription
             await this.activateSubscription(
-                paymentData.threadID,
-                paymentData.planId,
-                'system', // Will be updated with actual user info
-                paymentData.amount,
-                false
+                transaction.threadID,
+                transaction.planId,
+                transaction.userID,
+                transaction.amount,
+                false,
+                bonusDays,
+                transaction.promoCode || undefined
             );
 
-            // Clean up payment data
-            await this.database.global.remove(`payment_${orderCode}`);
+            // Mark promo code as used if applicable
+            if (transaction.promoCode) {
+                const promoManager = (global as any).bot.promoCodeManager;
+                if (promoManager) {
+                    await promoManager.markPromoCodeUsed(
+                        transaction.promoCode,
+                        transaction.threadID,
+                        transaction.userID,
+                        transaction.originalAmount || transaction.amount,
+                        transaction.amount
+                    );
+                }
+            }
 
-            Logger.success('PAYOS', `Subscription activated for thread ${paymentData.threadID}`, {
+            Logger.success('PAYOS', `Subscription activated for thread ${transaction.threadID}`, {
                 orderCode,
-                amount: paymentData.amount,
-                planId: paymentData.planId,
-                isRenewal: paymentData.isRenewal
+                amount: transaction.amount,
+                planId: transaction.planId,
+                promoCode: transaction.promoCode
             });
 
             return true;
         } catch (error) {
             Logger.error('PAYOS', 'Error handling payment success', error);
+
+            // Update transaction status to failed
+            try {
+                await this.database.updateTransactionStatus(orderCode, 'failed');
+            } catch (updateError) {
+                Logger.error('PAYOS', 'Failed to update transaction status to failed', updateError);
+            }
+
             return false;
         }
     }
@@ -311,48 +409,81 @@ export class PayOSManager {
         planId: string,
         userID: string,
         amountPaid: number,
-        isTrial: boolean = false
+        isTrial: boolean = false,
+        bonusDays: number = 0,
+        promoCode?: string
     ): Promise<ThreadSubscription> {
-
         const plan = this.subscriptionPlans.get(planId);
         if (!plan) {
             throw new Error(`Plan ${planId} not found`);
         }
 
         const now = new Date();
-        const endDate = new Date(now.getTime() + (plan.days * 24 * 60 * 60 * 1000));
+        const totalDays = plan.days + bonusDays;
+        let endDate = new Date(now.getTime() + (totalDays * 24 * 60 * 60 * 1000));
 
         const existingSubscription = await this.getThreadSubscription(threadID);
 
-        const subscription: ThreadSubscription = {
+        // If extending existing subscription, add to current end date
+        if (existingSubscription && existingSubscription.endDate > now) {
+            endDate = new Date(existingSubscription.endDate.getTime() + (totalDays * 24 * 60 * 60 * 1000));
+        }
+
+        const subscriptionHistory: SubscriptionHistory = {
+            action: existingSubscription ? 'renewed' : 'activated',
+            planId,
+            amount: amountPaid,
+            days: totalDays,
+            promoCode,
+            timestamp: now
+        };
+
+        const subscriptionData = {
             threadID,
             planId,
-            startDate: now,
+            startDate: existingSubscription?.startDate || now,
             endDate,
             isActive: true,
             totalPaid: (existingSubscription?.totalPaid || 0) + amountPaid,
             renewalCount: existingSubscription ? existingSubscription.renewalCount + 1 : 0,
             lastPaymentDate: now,
-            features: plan.features
+            features: plan.features,
+            isTrial,
+            createdBy: userID,
+            history: [
+                ...(existingSubscription?.history || []),
+                subscriptionHistory
+            ]
         };
 
-        await this.database.global.set(`subscription_${threadID}`, subscription);
+        // Save to enhanced database
+        const subscription = await this.database.createSubscription(subscriptionData);
 
-        // Update thread data
-        await this.database.threads.set(threadID, {
-            subscription: {
-                isActive: true,
-                planId,
-                endDate: endDate.toISOString(),
-                isTrial
-            }
-        }, 'subscription');
+        // Update thread data in main database
+        const mainDatabase = (global as any).bot.getDatabase();
+        if (mainDatabase) {
+            await mainDatabase.threads.set(threadID, {
+                subscription: {
+                    isActive: true,
+                    planId,
+                    endDate: endDate.toISOString(),
+                    isTrial,
+                    lastPayment: {
+                        amount: amountPaid,
+                        date: now.toISOString(),
+                        promoCode
+                    }
+                }
+            }, 'subscription');
+        }
 
         Logger.success('PAYOS', `Subscription activated for thread ${threadID}`, {
             planId,
-            days: plan.days,
+            totalDays,
             endDate: endDate.toISOString(),
-            isTrial
+            isTrial,
+            amountPaid,
+            promoCode
         });
 
         return subscription;
@@ -360,22 +491,24 @@ export class PayOSManager {
 
     // Deactivate expired subscription
     async deactivateSubscription(threadID: string): Promise<void> {
-        const subscription = await this.getThreadSubscription(threadID);
+        try {
+            await this.database.updateSubscription(threadID, { isActive: false });
 
-        if (subscription) {
-            subscription.isActive = false;
-            await this.database.global.set(`subscription_${threadID}`, subscription);
-        }
-
-        await this.database.threads.set(threadID, {
-            subscription: {
-                isActive: false,
-                endDate: null,
-                planId: null
+            const mainDatabase = (global as any).bot.getDatabase();
+            if (mainDatabase) {
+                await mainDatabase.threads.set(threadID, {
+                    subscription: {
+                        isActive: false,
+                        endDate: null,
+                        planId: null
+                    }
+                }, 'subscription');
             }
-        }, 'subscription');
 
-        Logger.info('PAYOS', `Subscription deactivated for thread ${threadID}`);
+            Logger.info('PAYOS', `Subscription deactivated for thread ${threadID}`);
+        } catch (error) {
+            Logger.error('PAYOS', `Failed to deactivate subscription for thread ${threadID}`, error);
+        }
     }
 
     // Get subscription plans for display
@@ -388,8 +521,12 @@ export class PayOSManager {
         return this.subscriptionPlans.get(planId);
     }
 
-    // Check if thread can use bot (has active subscription)
-    async canUseBot(threadID: string): Promise<{ canUse: boolean; reason?: string; subscription?: ThreadSubscription }> {
+    // Check if thread can use bot
+    async canUseBot(threadID: string): Promise<{
+        canUse: boolean;
+        reason?: string;
+        subscription?: ThreadSubscription | null
+    }> {
         try {
             const subscription = await this.getThreadSubscription(threadID);
 
@@ -459,9 +596,11 @@ export class PayOSManager {
                     `Use \`!subscribe\` to see available plans.`;
 
             case 'SUBSCRIPTION_EXPIRED':
+                const plan = subscription ? this.getPlan(subscription.planId) : null;
+                const renewalDiscount = plan?.renewalDiscount || 10;
                 return `⏰ **Subscription Expired**\n\n` +
                     `Your subscription expired on ${subscription?.endDate.toLocaleDateString()}.\n` +
-                    `Renew now with \`!renew\` to get ${this.getPlan(subscription!.planId)?.renewalDiscount || 10}% discount!`;
+                    `Renew now with \`!renew\` to get ${renewalDiscount}% discount!`;
 
             case 'SUBSCRIPTION_INACTIVE':
                 return `⚠️ **Subscription Inactive**\n\n` +
@@ -474,78 +613,37 @@ export class PayOSManager {
         }
     }
 
-    // Setup periodic subscription checker
-    private setupSubscriptionChecker(): void {
-        // Check every hour for expired subscriptions
-        setInterval(async () => {
-            await this.checkExpiredSubscriptions();
-        }, 60 * 60 * 1000);
-
-        // Check every day for expiring subscriptions (3 days before expiry)
-        setInterval(async () => {
-            await this.notifyExpiringSubscriptions();
-        }, 24 * 60 * 60 * 1000);
-
-        Logger.info('PAYOS', 'Subscription checker setup completed');
-    }
-
-    // Check and deactivate expired subscriptions
-    private async checkExpiredSubscriptions(): Promise<void> {
-        try {
-            // This would need to be implemented based on your database structure
-            // For now, it's a placeholder
-            Logger.debug('PAYOS', 'Checking for expired subscriptions...');
-        } catch (error) {
-            Logger.error('PAYOS', 'Error checking expired subscriptions', error);
-        }
-    }
-
-    // Notify about expiring subscriptions
-    private async notifyExpiringSubscriptions(): Promise<void> {
-        try {
-            // This would send notifications to groups about expiring subscriptions
-            Logger.debug('PAYOS', 'Checking for expiring subscriptions...');
-        } catch (error) {
-            Logger.error('PAYOS', 'Error notifying expiring subscriptions', error);
-        }
-    }
-
-    // Utility methods
-    private generateOrderCode(): number {
-        return Math.floor(Math.random() * 9999999) + 1000000;
-    }
-
     // Get renewal discount info
-    getRenewalDiscount(threadID: string): Promise<{ hasDiscount: boolean; discount: number; newPrice: number } | null> {
-        return new Promise(async (resolve) => {
-            try {
-                const subscription = await this.getThreadSubscription(threadID);
+    async getRenewalDiscount(threadID: string): Promise<{
+        hasDiscount: boolean;
+        discount: number;
+        newPrice: number;
+    } | null> {
+        try {
+            const subscription = await this.getThreadSubscription(threadID);
 
-                if (!subscription) {
-                    resolve(null);
-                    return;
-                }
-
-                const plan = this.getPlan(subscription.planId);
-
-                if (!plan || !plan.renewalDiscount) {
-                    resolve({ hasDiscount: false, discount: 0, newPrice: plan?.price || 0 });
-                    return;
-                }
-
-                const discountAmount = Math.floor(plan.price * (plan.renewalDiscount / 100));
-                const newPrice = plan.price - discountAmount;
-
-                resolve({
-                    hasDiscount: true,
-                    discount: plan.renewalDiscount,
-                    newPrice
-                });
-            } catch (error) {
-                Logger.error('PAYOS', 'Error getting renewal discount', error);
-                resolve(null);
+            if (!subscription) {
+                return null;
             }
-        });
+
+            const plan = this.getPlan(subscription.planId);
+
+            if (!plan || !plan.renewalDiscount) {
+                return { hasDiscount: false, discount: 0, newPrice: plan?.price || 0 };
+            }
+
+            const discountAmount = Math.floor(plan.price * (plan.renewalDiscount / 100));
+            const newPrice = plan.price - discountAmount;
+
+            return {
+                hasDiscount: true,
+                discount: plan.renewalDiscount,
+                newPrice
+            };
+        } catch (error) {
+            Logger.error('PAYOS', 'Error getting renewal discount', error);
+            return null;
+        }
     }
 
     // Get subscription statistics
@@ -556,14 +654,173 @@ export class PayOSManager {
         totalRevenue: number;
         planStats: Record<string, number>;
     }> {
-        // This would need proper implementation based on your database
-        // For now, return placeholder data
-        return {
-            totalSubscriptions: 0,
-            activeSubscriptions: 0,
-            expiredSubscriptions: 0,
-            totalRevenue: 0,
-            planStats: {}
-        };
+        try {
+            return await this.database.getSubscriptionStats();
+        } catch (error) {
+            Logger.error('PAYOS', 'Error getting subscription statistics', error);
+            return {
+                totalSubscriptions: 0,
+                activeSubscriptions: 0,
+                expiredSubscriptions: 0,
+                totalRevenue: 0,
+                planStats: {}
+            };
+        }
+    }
+
+    // Get enhanced subscription statistics
+    async getEnhancedSubscriptionStats(): Promise<any> {
+        try {
+            const [subscriptionStats, transactionStats, revenueAnalytics] = await Promise.all([
+                this.database.getSubscriptionStats(),
+                this.database.getTransactionStats(30),
+                this.database.getRevenueAnalytics(30)
+            ]);
+
+            return {
+                revenue: {
+                    total: revenueAnalytics.totalRevenue,
+                    thisMonth: transactionStats.totalRevenue,
+                    lastMonth: 0, // Would need additional query
+                    growth: revenueAnalytics.monthlyGrowth
+                },
+                subscriptions: {
+                    total: subscriptionStats.total,
+                    active: subscriptionStats.active,
+                    expired: subscriptionStats.expired,
+                    trials: subscriptionStats.trials
+                },
+                plans: subscriptionStats.planDistribution,
+                promoCodes: {
+                    totalUses: 0, // Would be populated by promo manager
+                    totalSavings: 0,
+                    topCodes: []
+                },
+                transactions: {
+                    total: transactionStats.total,
+                    thisMonth: transactionStats.successful,
+                    averageOrderValue: transactionStats.averageOrderValue
+                }
+            };
+        } catch (error) {
+            Logger.error('PAYOS', 'Error getting enhanced statistics', error);
+            throw error;
+        }
+    }
+
+    // Setup periodic tasks
+    private setupPeriodicTasks(): void {
+        // Check expired subscriptions every hour
+        setInterval(async () => {
+            await this.checkExpiredSubscriptions();
+        }, 60 * 60 * 1000);
+
+        // Notify expiring subscriptions daily
+        setInterval(async () => {
+            await this.notifyExpiringSubscriptions();
+        }, 24 * 60 * 60 * 1000);
+
+        Logger.info('PAYOS', 'Subscription checker setup completed');
+    }
+
+    // Check and deactivate expired subscriptions
+    private async checkExpiredSubscriptions(): Promise<void> {
+        try {
+            const expiredSubscriptions = await this.database.getExpiredSubscriptions();
+
+            for (const subscription of expiredSubscriptions) {
+                if (subscription.isActive) {
+                    await this.deactivateSubscription(subscription.threadID);
+                    Logger.info('PAYOS', `Auto-deactivated expired subscription for thread ${subscription.threadID}`);
+                }
+            }
+        } catch (error) {
+            Logger.error('PAYOS', 'Error checking expired subscriptions', error);
+        }
+    }
+
+    // Notify about expiring subscriptions
+    private async notifyExpiringSubscriptions(): Promise<void> {
+        try {
+            // Get subscriptions expiring in 3 days
+            const threeDaysFromNow = new Date();
+            threeDaysFromNow.setDate(threeDaysFromNow.getDate() + 3);
+
+            const activeSubscriptions = await this.database.getActiveSubscriptions();
+            const expiringSubscriptions = activeSubscriptions.filter(
+                sub => sub.endDate <= threeDaysFromNow
+            );
+
+            const api = (global as any).bot.getAPI();
+            if (!api) return;
+
+            for (const subscription of expiringSubscriptions) {
+                const plan = this.getPlan(subscription.planId);
+                const daysLeft = Math.ceil((subscription.endDate.getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+
+                if (daysLeft <= 3 && daysLeft > 0) {
+                    const renewalDiscount = plan?.renewalDiscount || 10;
+                    const notificationMessage = `⚠️ **Subscription Expiring Soon!**\n\n` +
+                        `📅 **${daysLeft} day${daysLeft > 1 ? 's' : ''} remaining**\n` +
+                        `🎉 **Renew now and save ${renewalDiscount}%!**\n` +
+                        `Use \`!renew\` to extend your subscription`;
+
+                    try {
+                        await api.sendMessage(notificationMessage, subscription.threadID);
+                        Logger.info('PAYOS', `Sent expiry notification to thread ${subscription.threadID}`);
+                    } catch (error) {
+                        Logger.warn('PAYOS', `Failed to send expiry notification to thread ${subscription.threadID}`, error);
+                    }
+                }
+            }
+        } catch (error) {
+            Logger.error('PAYOS', 'Error notifying expiring subscriptions', error);
+        }
+    }
+
+    // Utility methods
+    private generateOrderCode(): number {
+        return Math.floor(Math.random() * 9999999) + 1000000;
+    }
+
+    // Handle payment cancellation
+    async handlePaymentCancellation(orderCode: number): Promise<void> {
+        try {
+            await this.database.updateTransactionStatus(orderCode, 'cancelled');
+            Logger.info('PAYOS', `Payment ${orderCode} marked as cancelled`);
+        } catch (error) {
+            Logger.error('PAYOS', `Failed to update cancelled payment ${orderCode}`, error);
+        }
+    }
+
+    // Get transaction history for thread
+    async getTransactionHistory(threadID: string, limit: number = 10): Promise<PaymentData[]> {
+        try {
+            return await this.database.getTransactionsByThread(threadID, limit);
+        } catch (error) {
+            Logger.error('PAYOS', `Error getting transaction history for thread ${threadID}`, error);
+            return [];
+        }
+    }
+
+    // Manual subscription activation (admin)
+    async manualActivation(
+        threadID: string,
+        planId: string,
+        adminUserID: string,
+        reason: string
+    ): Promise<ThreadSubscription> {
+        const plan = this.getPlan(planId);
+        if (!plan) {
+            throw new Error(`Plan ${planId} not found`);
+        }
+
+        Logger.info('PAYOS', `Manual activation requested by admin ${adminUserID}`, {
+            threadID,
+            planId,
+            reason
+        });
+
+        return await this.activateSubscription(threadID, planId, adminUserID, 0, false, 0);
     }
 }

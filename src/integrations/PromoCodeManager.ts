@@ -1,9 +1,10 @@
-// src/integrations/PromoCodeManager.ts
-import { DatabaseManager } from '../types/interfaces';
+// src/integrations/PromoCodeManager.ts - Enhanced version with SQL integration
+import { EnhancedSQLiteDatabase } from '../database/providers/EnhancedSQLiteDatabase';
 import { Logger } from '../utils/Logger';
 import { Utils } from '../utils/Utils';
 
 export interface PromoCode {
+    id: string;
     code: string;
     type: 'discount' | 'free_activation' | 'extend_days';
     value: number; // Percentage for discount, days for extend_days
@@ -15,54 +16,35 @@ export interface PromoCode {
     createdAt: Date;
     isActive: boolean;
     description: string;
-    usedBy: Array<{
-        threadID: string;
-        userID: string;
-        usedAt: Date;
-        originalPrice?: number;
-        discountedPrice?: number;
-    }>;
+}
+
+export interface PromoCodeUsage {
+    id: string;
+    promoCode: string;
+    threadID: string;
+    userID: string;
+    planId: string;
+    originalAmount: number;
+    discountedAmount: number;
+    discountAmount: number;
+    timestamp: Date;
 }
 
 export class PromoCodeManager {
-    private database: DatabaseManager;
+    private database: EnhancedSQLiteDatabase;
     private promoCodes: Map<string, PromoCode> = new Map();
 
-    constructor(database: DatabaseManager) {
+    constructor(database: EnhancedSQLiteDatabase) {
         this.database = database;
         this.loadPromoCodes();
     }
 
     private async loadPromoCodes(): Promise<void> {
         try {
-            const codes = await this.database.global.get('promo_codes', []);
-
-            for (const codeData of codes) {
-                const promoCode: PromoCode = {
-                    ...codeData,
-                    expiryDate: new Date(codeData.expiryDate),
-                    createdAt: new Date(codeData.createdAt),
-                    usedBy: codeData.usedBy.map((usage: any) => ({
-                        ...usage,
-                        usedAt: new Date(usage.usedAt)
-                    }))
-                };
-
-                this.promoCodes.set(promoCode.code.toUpperCase(), promoCode);
-            }
-
-            Logger.info('PROMO', `Loaded ${this.promoCodes.size} promo codes`);
+            // Load from enhanced database instead of global storage
+            Logger.info('PROMO', 'Loading promo codes from database...');
         } catch (error) {
             Logger.error('PROMO', 'Error loading promo codes', error);
-        }
-    }
-
-    private async savePromoCodes(): Promise<void> {
-        try {
-            const codesArray = Array.from(this.promoCodes.values());
-            await this.database.global.set('promo_codes', codesArray);
-        } catch (error) {
-            Logger.error('PROMO', 'Error saving promo codes', error);
         }
     }
 
@@ -79,7 +61,9 @@ export class PromoCodeManager {
     ): Promise<PromoCode> {
         const normalizedCode = code.toUpperCase();
 
-        if (this.promoCodes.has(normalizedCode)) {
+        // Check if code already exists
+        const existingPromos = await this.database.getPromoUsage(normalizedCode);
+        if (existingPromos.length > 0) {
             throw new Error(`Promo code ${normalizedCode} already exists`);
         }
 
@@ -97,6 +81,7 @@ export class PromoCodeManager {
         }
 
         const promoCode: PromoCode = {
+            id: Utils.generateID(),
             code: normalizedCode,
             type,
             value,
@@ -107,12 +92,22 @@ export class PromoCodeManager {
             createdBy,
             createdAt: new Date(),
             isActive: true,
-            description: description || `${type} promo code`,
-            usedBy: []
+            description: description || `${type} promo code`
         };
 
+        // Store in database using global storage as fallback
+        try {
+            const mainDatabase = (global as any).bot.getDatabase();
+            if (mainDatabase) {
+                const allPromoCodes = await mainDatabase.global.get('promo_codes', []);
+                allPromoCodes.push(promoCode);
+                await mainDatabase.global.set('promo_codes', allPromoCodes);
+            }
+        } catch (error) {
+            Logger.error('PROMO', 'Error saving promo code to main database', error);
+        }
+
         this.promoCodes.set(normalizedCode, promoCode);
-        await this.savePromoCodes();
 
         Logger.success('PROMO', `Created promo code ${normalizedCode}`, {
             type,
@@ -140,7 +135,9 @@ export class PromoCodeManager {
         error?: string;
     }> {
         const normalizedCode = code.toUpperCase();
-        const promoCode = this.promoCodes.get(normalizedCode);
+
+        // Get promo code from database
+        const promoCode = await this.getPromoCodeFromDB(normalizedCode);
 
         if (!promoCode) {
             return { isValid: false, error: 'Invalid promo code' };
@@ -162,11 +159,9 @@ export class PromoCodeManager {
         }
 
         // Check if user/thread already used this code
-        const alreadyUsed = promoCode.usedBy.some(usage =>
-            usage.threadID === threadID || usage.userID === userID
-        );
+        const alreadyUsed = await this.database.checkPromoUsedByThread(normalizedCode, threadID);
         if (alreadyUsed) {
-            return { isValid: false, error: 'Promo code already used by this user/group' };
+            return { isValid: false, error: 'Promo code already used by this group' };
         }
 
         // Check plan restriction
@@ -220,55 +215,133 @@ export class PromoCodeManager {
         discountedPrice?: number
     ): Promise<void> {
         const normalizedCode = code.toUpperCase();
-        const promoCode = this.promoCodes.get(normalizedCode);
+        const promoCode = await this.getPromoCodeFromDB(normalizedCode);
 
         if (!promoCode) {
             throw new Error('Promo code not found');
         }
 
-        promoCode.currentUses++;
-        promoCode.usedBy.push({
-            threadID,
-            userID,
-            usedAt: new Date(),
-            originalPrice,
-            discountedPrice
-        });
+        try {
+            // Record usage in enhanced database
+            await this.database.recordPromoUsage({
+                promoCode: normalizedCode,
+                threadID,
+                userID,
+                planId: '', // Will be filled by the calling function
+                originalAmount: originalPrice || 0,
+                discountedAmount: discountedPrice || 0,
+                discountAmount: (originalPrice || 0) - (discountedPrice || 0),
+                timestamp: new Date()
+            });
 
-        await this.savePromoCodes();
+            // Update usage count in main database
+            const mainDatabase = (global as any).bot.getDatabase();
+            if (mainDatabase) {
+                const allPromoCodes = await mainDatabase.global.get('promo_codes', []);
+                const promoIndex = allPromoCodes.findIndex((p: PromoCode) => p.code === normalizedCode);
 
-        Logger.info('PROMO', `Promo code ${normalizedCode} used`, {
-            threadID,
-            userID,
-            currentUses: promoCode.currentUses,
-            maxUses: promoCode.maxUses
-        });
+                if (promoIndex !== -1) {
+                    allPromoCodes[promoIndex].currentUses++;
+                    await mainDatabase.global.set('promo_codes', allPromoCodes);
+                }
+            }
+
+            // Update local cache
+            if (this.promoCodes.has(normalizedCode)) {
+                const localPromo = this.promoCodes.get(normalizedCode)!;
+                localPromo.currentUses++;
+            }
+
+            Logger.info('PROMO', `Promo code ${normalizedCode} used`, {
+                threadID,
+                userID,
+                currentUses: promoCode.currentUses + 1,
+                maxUses: promoCode.maxUses
+            });
+        } catch (error) {
+            Logger.error('PROMO', `Error marking promo code ${normalizedCode} as used`, error);
+            throw error;
+        }
     }
 
     // Get all promo codes (admin)
     async getAllPromoCodes(): Promise<PromoCode[]> {
-        return Array.from(this.promoCodes.values());
+        try {
+            const mainDatabase = (global as any).bot.getDatabase();
+            if (mainDatabase) {
+                const allPromoCodes = await mainDatabase.global.get('promo_codes', []);
+                return allPromoCodes.map((code: any) => ({
+                    ...code,
+                    expiryDate: new Date(code.expiryDate),
+                    createdAt: new Date(code.createdAt)
+                }));
+            }
+            return [];
+        } catch (error) {
+            Logger.error('PROMO', 'Error getting all promo codes', error);
+            return [];
+        }
     }
 
     // Get promo code details
-    getPromoCode(code: string): PromoCode | undefined {
-        return this.promoCodes.get(code.toUpperCase());
+    async getPromoCode(code: string): Promise<PromoCode | undefined> {
+        return await this.getPromoCodeFromDB(code.toUpperCase());
+    }
+
+    // Get promo code from database
+    private async getPromoCodeFromDB(code: string): Promise<PromoCode | undefined> {
+        try {
+            const mainDatabase = (global as any).bot.getDatabase();
+            if (mainDatabase) {
+                const allPromoCodes = await mainDatabase.global.get('promo_codes', []);
+                const promoCode = allPromoCodes.find((p: PromoCode) => p.code === code);
+
+                if (promoCode) {
+                    return {
+                        ...promoCode,
+                        expiryDate: new Date(promoCode.expiryDate),
+                        createdAt: new Date(promoCode.createdAt)
+                    };
+                }
+            }
+
+            return undefined;
+        } catch (error) {
+            Logger.error('PROMO', `Error getting promo code ${code} from database`, error);
+            return undefined;
+        }
     }
 
     // Deactivate promo code
     async deactivatePromoCode(code: string): Promise<boolean> {
         const normalizedCode = code.toUpperCase();
-        const promoCode = this.promoCodes.get(normalizedCode);
 
-        if (!promoCode) {
+        try {
+            const mainDatabase = (global as any).bot.getDatabase();
+            if (mainDatabase) {
+                const allPromoCodes = await mainDatabase.global.get('promo_codes', []);
+                const promoIndex = allPromoCodes.findIndex((p: PromoCode) => p.code === normalizedCode);
+
+                if (promoIndex !== -1) {
+                    allPromoCodes[promoIndex].isActive = false;
+                    await mainDatabase.global.set('promo_codes', allPromoCodes);
+
+                    // Update local cache
+                    if (this.promoCodes.has(normalizedCode)) {
+                        const localPromo = this.promoCodes.get(normalizedCode)!;
+                        localPromo.isActive = false;
+                    }
+
+                    Logger.info('PROMO', `Deactivated promo code ${normalizedCode}`);
+                    return true;
+                }
+            }
+
+            return false;
+        } catch (error) {
+            Logger.error('PROMO', `Error deactivating promo code ${normalizedCode}`, error);
             return false;
         }
-
-        promoCode.isActive = false;
-        await this.savePromoCodes();
-
-        Logger.info('PROMO', `Deactivated promo code ${normalizedCode}`);
-        return true;
     }
 
     // Generate random promo code
@@ -288,609 +361,179 @@ export class PromoCodeManager {
         totalUses: number;
         totalSavings: number;
     }> {
-        let totalUses = 0;
-        let activeCodes = 0;
-        let totalSavings = 0;
+        try {
+            // Get stats from enhanced database
+            const enhancedStats = await this.database.getPromoUsageStats();
 
-        for (const promoCode of this.promoCodes.values()) {
-            if (promoCode.isActive && new Date() < promoCode.expiryDate) {
-                activeCodes++;
-            }
+            // Get additional stats from main database
+            const allPromoCodes = await this.getAllPromoCodes();
+            const activeCodes = allPromoCodes.filter(code =>
+                code.isActive && new Date() < code.expiryDate
+            ).length;
 
-            totalUses += promoCode.currentUses;
-
-            for (const usage of promoCode.usedBy) {
-                if (usage.originalPrice && usage.discountedPrice) {
-                    totalSavings += usage.originalPrice - usage.discountedPrice;
-                }
-            }
+            return {
+                totalCodes: allPromoCodes.length,
+                activeCodes,
+                totalUses: enhancedStats.totalUses,
+                totalSavings: enhancedStats.totalSavings
+            };
+        } catch (error) {
+            Logger.error('PROMO', 'Error getting promo code statistics', error);
+            return {
+                totalCodes: 0,
+                activeCodes: 0,
+                totalUses: 0,
+                totalSavings: 0
+            };
         }
-
-        return {
-            totalCodes: this.promoCodes.size,
-            activeCodes,
-            totalUses,
-            totalSavings
-        };
     }
 
     // Clean expired codes
     async cleanExpiredCodes(): Promise<number> {
-        const now = new Date();
-        let cleaned = 0;
-
-        for (const [code, promoCode] of this.promoCodes.entries()) {
-            if (now > promoCode.expiryDate && promoCode.currentUses === 0) {
-                this.promoCodes.delete(code);
-                cleaned++;
-            }
-        }
-
-        if (cleaned > 0) {
-            await this.savePromoCodes();
-            Logger.info('PROMO', `Cleaned ${cleaned} expired unused promo codes`);
-        }
-
-        return cleaned;
-    }
-}
-
-// Enhanced PayOSManager with promo code integration
-// src/integrations/PayOSManager.ts - Enhanced version
-import PayOS from '@payos/node';
-import { Logger } from '../utils/Logger';
-import { Utils } from '../utils/Utils';
-import { DatabaseManager } from '../types/interfaces';
-import { PromoCodeManager } from './PromoCodeManager';
-
-// Add to existing interfaces
-export interface PaymentData {
-    orderCode: number;
-    amount: number;
-    description: string;
-    threadID: string;
-    planId: string;
-    isRenewal: boolean;
-    originalAmount?: number;
-    discountAmount?: number;
-    promoCode?: string;
-    promoDiscount?: number;
-    totalDays?: number; // Including bonus days from promo
-}
-
-export class EnhancedPayOSManager {
-    private payos: PayOS;
-    private database: DatabaseManager;
-    private config: any;
-    private promoCodeManager: PromoCodeManager;
-    private subscriptionPlans: Map<string, SubscriptionPlan> = new Map();
-
-    // Statistics tracking
-    private statistics = {
-        totalRevenue: 0,
-        totalSubscriptions: 0,
-        activeSubscriptions: 0,
-        totalPromoUses: 0,
-        totalPromoSavings: 0
-    };
-
-    constructor(database: DatabaseManager, config: any) {
-        this.database = database;
-        this.config = config;
-        this.promoCodeManager = new PromoCodeManager(database);
-
-        if (config.payos?.enable) {
-            this.payos = new PayOS(
-                config.payos.clientId,
-                config.payos.apiKey,
-                config.payos.checksumKey
-            );
-        }
-
-        this.loadSubscriptionPlans();
-        this.loadStatistics();
-        this.setupPeriodicTasks();
-    }
-
-    private async loadStatistics(): Promise<void> {
-        try {
-            const stats = await this.database.global.get('subscription_statistics', {});
-            this.statistics = { ...this.statistics, ...stats };
-        } catch (error) {
-            Logger.error('PAYOS', 'Error loading statistics', error);
-        }
-    }
-
-    private async saveStatistics(): Promise<void> {
-        try {
-            await this.database.global.set('subscription_statistics', this.statistics);
-        } catch (error) {
-            Logger.error('PAYOS', 'Error saving statistics', error);
-        }
-    }
-
-    // Enhanced subscription activation with promo support
-    async activateSubscription(
-        threadID: string,
-        planId: string,
-        userID: string,
-        amountPaid: number,
-        isTrial: boolean = false,
-        bonusDays: number = 0,
-        promoCode?: string
-    ): Promise<ThreadSubscription> {
-
-        const plan = this.subscriptionPlans.get(planId);
-        if (!plan) {
-            throw new Error(`Plan ${planId} not found`);
-        }
-
-        const now = new Date();
-        const totalDays = plan.days + bonusDays;
-        const endDate = new Date(now.getTime() + (totalDays * 24 * 60 * 60 * 1000));
-
-        const existingSubscription = await this.getThreadSubscription(threadID);
-
-        // If extending existing subscription, add to current end date
-        let actualEndDate = endDate;
-        if (existingSubscription && existingSubscription.endDate > now) {
-            actualEndDate = new Date(existingSubscription.endDate.getTime() + (totalDays * 24 * 60 * 60 * 1000));
-        }
-
-        const subscription: ThreadSubscription = {
-            threadID,
-            planId,
-            startDate: existingSubscription?.startDate || now,
-            endDate: actualEndDate,
-            isActive: true,
-            totalPaid: (existingSubscription?.totalPaid || 0) + amountPaid,
-            renewalCount: existingSubscription ? existingSubscription.renewalCount + 1 : 0,
-            lastPaymentDate: now,
-            features: plan.features,
-            history: [
-                ...(existingSubscription?.history || []),
-                {
-                    action: existingSubscription ? 'renewed' : 'activated',
-                    planId,
-                    amount: amountPaid,
-                    days: totalDays,
-                    promoCode,
-                    timestamp: now
-                }
-            ]
-        };
-
-        // Save subscription data
-        await this.database.global.set(`subscription_${threadID}`, subscription);
-
-        // Update thread data
-        await this.database.threads.set(threadID, {
-            subscription: {
-                isActive: true,
-                planId,
-                endDate: actualEndDate.toISOString(),
-                isTrial,
-                lastPayment: {
-                    amount: amountPaid,
-                    date: now.toISOString(),
-                    promoCode
-                }
-            }
-        }, 'subscription');
-
-        // Update statistics
-        this.statistics.totalRevenue += amountPaid;
-        if (!existingSubscription) {
-            this.statistics.totalSubscriptions++;
-            this.statistics.activeSubscriptions++;
-        }
-        await this.saveStatistics();
-
-        Logger.success('PAYOS', `Subscription activated for thread ${threadID}`, {
-            planId,
-            totalDays,
-            endDate: actualEndDate.toISOString(),
-            isTrial,
-            amountPaid,
-            promoCode
-        });
-
-        return subscription;
-    }
-
-    // Enhanced payment creation with promo code support
-    async createSubscriptionPayment(
-        threadID: string,
-        planId: string,
-        userID: string,
-        promoCode?: string
-    ): Promise<{
-        checkoutUrl: string;
-        orderCode: number;
-        amount: number;
-        isRenewal: boolean;
-        promoApplied?: string;
-        discountAmount?: number;
-        bonusDays?: number;
-    }> {
-
-        if (!this.payos) {
-            throw new Error('PayOS not initialized');
-        }
-
-        const plan = this.subscriptionPlans.get(planId);
-        if (!plan) {
-            throw new Error(`Plan ${planId} not found`);
-        }
-
-        const existingSubscription = await this.getThreadSubscription(threadID);
-        const isRenewal = !!existingSubscription;
-
-        let finalAmount = plan.price;
-        let discountAmount = 0;
-        let bonusDays = 0;
-        let appliedPromoCode = '';
-
-        // Apply renewal discount first
-        if (isRenewal && plan.renewalDiscount && plan.renewalDiscount > 0) {
-            const renewalDiscount = Math.floor(plan.price * (plan.renewalDiscount / 100));
-            finalAmount = plan.price - renewalDiscount;
-            discountAmount += renewalDiscount;
-        }
-
-        // Apply promo code if provided
-        if (promoCode) {
-            const promoResult = await this.promoCodeManager.validateAndApplyPromoCode(
-                promoCode, threadID, userID, planId, finalAmount
-            );
-
-            if (!promoResult.isValid) {
-                throw new Error(promoResult.error);
-            }
-
-            if (promoResult.discountedPrice !== undefined) {
-                const promoDiscount = finalAmount - promoResult.discountedPrice;
-                finalAmount = promoResult.discountedPrice;
-                discountAmount += promoDiscount;
-            }
-
-            if (promoResult.freeDays) {
-                bonusDays = promoResult.freeDays;
-            }
-
-            appliedPromoCode = promoCode;
-        }
-
-        // Handle free activation
-        if (finalAmount === 0) {
-            await this.activateSubscription(threadID, planId, userID, 0, plan.id === 'trial', bonusDays, appliedPromoCode);
-
-            if (appliedPromoCode) {
-                await this.promoCodeManager.markPromoCodeUsed(appliedPromoCode, threadID, userID, plan.price, 0);
-            }
-
-            throw new Error('FREE_ACTIVATED');
-        }
-
-        const orderCode = this.generateOrderCode();
-
-        const paymentData: PaymentData = {
-            orderCode,
-            amount: finalAmount,
-            description: isRenewal
-                ? `Gia hạn ${plan.name} cho nhóm ${threadID}`
-                : `Đăng ký ${plan.name} cho nhóm ${threadID}`,
-            threadID,
-            planId,
-            isRenewal,
-            originalAmount: plan.price,
-            discountAmount,
-            promoCode: appliedPromoCode,
-            totalDays: plan.days + bonusDays
-        };
-
-        // Store payment data for verification
-        await this.database.global.set(`payment_${orderCode}`, paymentData);
-
-        const body = {
-            orderCode,
-            amount: finalAmount,
-            description: paymentData.description,
-            items: [
-                {
-                    name: plan.name + (bonusDays ? ` + ${bonusDays} bonus days` : ''),
-                    quantity: 1,
-                    price: finalAmount,
-                }
-            ],
-            returnUrl: `${this.config.payos.webhookUrl}/payment/success?orderCode=${orderCode}`,
-            cancelUrl: `${this.config.payos.webhookUrl}/payment/cancel?orderCode=${orderCode}`
-        };
-
-        const paymentLinkResponse = await this.payos.createPaymentLink(body);
-
-        Logger.info('PAYOS', `Created payment for thread ${threadID}`, {
-            orderCode,
-            amount: finalAmount,
-            plan: plan.name,
-            isRenewal,
-            discount: discountAmount,
-            promoCode: appliedPromoCode,
-            bonusDays
-        });
-
-        return {
-            checkoutUrl: paymentLinkResponse.checkoutUrl,
-            orderCode,
-            amount: finalAmount,
-            isRenewal,
-            promoApplied: appliedPromoCode,
-            discountAmount,
-            bonusDays
-        };
-    }
-
-    // Enhanced payment success handler
-    async handlePaymentSuccess(orderCode: number): Promise<boolean> {
-        try {
-            // Verify payment with PayOS
-            const paymentInfo = await this.payos.getPaymentLinkInformation(orderCode);
-
-            if (paymentInfo.status !== 'PAID') {
-                Logger.warn('PAYOS', `Payment ${orderCode} not confirmed as paid`);
-                return false;
-            }
-
-            // Get stored payment data
-            const paymentData = await this.database.global.get(`payment_${orderCode}`) as PaymentData;
-
-            if (!paymentData) {
-                Logger.error('PAYOS', `Payment data not found for order ${orderCode}`);
-                return false;
-            }
-
-            // Calculate bonus days
-            const bonusDays = paymentData.totalDays
-                ? paymentData.totalDays - this.subscriptionPlans.get(paymentData.planId)!.days
-                : 0;
-
-            // Activate subscription
-            await this.activateSubscription(
-                paymentData.threadID,
-                paymentData.planId,
-                'system',
-                paymentData.amount,
-                false,
-                bonusDays,
-                paymentData.promoCode
-            );
-
-            // Mark promo code as used
-            if (paymentData.promoCode) {
-                await this.promoCodeManager.markPromoCodeUsed(
-                    paymentData.promoCode,
-                    paymentData.threadID,
-                    'system',
-                    paymentData.originalAmount,
-                    paymentData.amount
-                );
-            }
-
-            // Log transaction
-            await this.logTransaction({
-                orderCode,
-                threadID: paymentData.threadID,
-                planId: paymentData.planId,
-                amount: paymentData.amount,
-                originalAmount: paymentData.originalAmount,
-                discountAmount: paymentData.discountAmount,
-                promoCode: paymentData.promoCode,
-                timestamp: new Date(),
-                status: 'success'
-            });
-
-            // Clean up payment data
-            await this.database.global.remove(`payment_${orderCode}`);
-
-            Logger.success('PAYOS', `Subscription activated for thread ${paymentData.threadID}`, {
-                orderCode,
-                amount: paymentData.amount,
-                planId: paymentData.planId,
-                promoCode: paymentData.promoCode
-            });
-
-            return true;
-        } catch (error) {
-            Logger.error('PAYOS', 'Error handling payment success', error);
-            return false;
-        }
-    }
-
-    // Transaction logging
-    private async logTransaction(transaction: any): Promise<void> {
-        try {
-            const transactions = await this.database.global.get('transactions', []);
-            transactions.push(transaction);
-
-            // Keep only last 1000 transactions
-            if (transactions.length > 1000) {
-                transactions.splice(0, transactions.length - 1000);
-            }
-
-            await this.database.global.set('transactions', transactions);
-        } catch (error) {
-            Logger.error('PAYOS', 'Error logging transaction', error);
-        }
-    }
-
-    // Get promo code manager
-    getPromoCodeManager(): PromoCodeManager {
-        return this.promoCodeManager;
-    }
-
-    // Enhanced subscription statistics
-    async getEnhancedSubscriptionStats(): Promise<{
-        revenue: {
-            total: number;
-            thisMonth: number;
-            lastMonth: number;
-            growth: number;
-        };
-        subscriptions: {
-            total: number;
-            active: number;
-            expired: number;
-            trials: number;
-        };
-        plans: Record<string, {
-            subscriptions: number;
-            revenue: number;
-            averageLifetime: number;
-        }>;
-        promoCodes: {
-            totalUses: number;
-            totalSavings: number;
-            topCodes: Array<{
-                code: string;
-                uses: number;
-                savings: number;
-            }>;
-        };
-        transactions: {
-            total: number;
-            thisMonth: number;
-            averageOrderValue: number;
-        };
-    }> {
         try {
             const now = new Date();
-            const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-            const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+            let cleaned = 0;
 
-            // Get all transactions
-            const transactions = await this.database.global.get('transactions', []);
+            const mainDatabase = (global as any).bot.getDatabase();
+            if (mainDatabase) {
+                const allPromoCodes = await mainDatabase.global.get('promo_codes', []);
+                const validPromoCodes = [];
 
-            // Calculate revenue
-            const thisMonthRevenue = transactions
-                .filter((t: any) => new Date(t.timestamp) >= thisMonthStart)
-                .reduce((sum: number, t: any) => sum + t.amount, 0);
+                for (const code of allPromoCodes) {
+                    const expiryDate = new Date(code.expiryDate);
 
-            const lastMonthRevenue = transactions
-                .filter((t: any) => new Date(t.timestamp) >= lastMonthStart && new Date(t.timestamp) < thisMonthStart)
-                .reduce((sum: number, t: any) => sum + t.amount, 0);
-
-            const revenueGrowth = lastMonthRevenue > 0
-                ? ((thisMonthRevenue - lastMonthRevenue) / lastMonthRevenue) * 100
-                : 0;
-
-            // Get subscription counts
-            const allSubscriptions = await this.getAllSubscriptions();
-            const activeCount = allSubscriptions.filter(s => s.isActive && s.endDate > now).length;
-            const expiredCount = allSubscriptions.filter(s => !s.isActive || s.endDate <= now).length;
-            const trialsCount = allSubscriptions.filter(s => s.planId === 'trial').length;
-
-            // Plan statistics
-            const planStats: Record<string, any> = {};
-            for (const plan of this.subscriptionPlans.values()) {
-                const planSubscriptions = allSubscriptions.filter(s => s.planId === plan.id);
-                const planRevenue = transactions
-                    .filter((t: any) => t.planId === plan.id)
-                    .reduce((sum: number, t: any) => sum + t.amount, 0);
-
-                planStats[plan.id] = {
-                    subscriptions: planSubscriptions.length,
-                    revenue: planRevenue,
-                    averageLifetime: planSubscriptions.length > 0
-                        ? planSubscriptions.reduce((sum, s) => sum + s.renewalCount + 1, 0) / planSubscriptions.length
-                        : 0
-                };
-            }
-
-            // Promo code statistics
-            const promoStats = await this.promoCodeManager.getPromoCodeStats();
-            const allPromoCodes = await this.promoCodeManager.getAllPromoCodes();
-            const topCodes = allPromoCodes
-                .sort((a, b) => b.currentUses - a.currentUses)
-                .slice(0, 5)
-                .map(code => ({
-                    code: code.code,
-                    uses: code.currentUses,
-                    savings: code.usedBy.reduce((sum, usage) =>
-                        sum + ((usage.originalPrice || 0) - (usage.discountedPrice || 0)), 0)
-                }));
-
-            return {
-                revenue: {
-                    total: this.statistics.totalRevenue,
-                    thisMonth: thisMonthRevenue,
-                    lastMonth: lastMonthRevenue,
-                    growth: revenueGrowth
-                },
-                subscriptions: {
-                    total: allSubscriptions.length,
-                    active: activeCount,
-                    expired: expiredCount,
-                    trials: trialsCount
-                },
-                plans: planStats,
-                promoCodes: {
-                    totalUses: promoStats.totalUses,
-                    totalSavings: promoStats.totalSavings,
-                    topCodes
-                },
-                transactions: {
-                    total: transactions.length,
-                    thisMonth: transactions.filter((t: any) => new Date(t.timestamp) >= thisMonthStart).length,
-                    averageOrderValue: transactions.length > 0
-                        ? transactions.reduce((sum: number, t: any) => sum + t.amount, 0) / transactions.length
-                        : 0
+                    if (now > expiryDate && code.currentUses === 0) {
+                        cleaned++;
+                        Logger.debug('PROMO', `Cleaned expired unused promo code: ${code.code}`);
+                    } else {
+                        validPromoCodes.push(code);
+                    }
                 }
-            };
-        } catch (error) {
-            Logger.error('PAYOS', 'Error getting enhanced statistics', error);
-            throw error;
-        }
-    }
 
-    // Get all subscriptions for statistics
-    private async getAllSubscriptions(): Promise<ThreadSubscription[]> {
-        try {
-            // This would need to be implemented based on your database structure
-            // For now, return empty array as placeholder
-            return [];
-        } catch (error) {
-            Logger.error('PAYOS', 'Error getting all subscriptions', error);
-            return [];
-        }
-    }
-
-    // Periodic cleanup and maintenance tasks
-    private setupPeriodicTasks(): void {
-        // Clean expired promo codes daily
-        setInterval(async () => {
-            try {
-                const cleaned = await this.promoCodeManager.cleanExpiredCodes();
                 if (cleaned > 0) {
-                    Logger.info('PAYOS', `Cleaned ${cleaned} expired promo codes`);
+                    await mainDatabase.global.set('promo_codes', validPromoCodes);
+                    Logger.info('PROMO', `Cleaned ${cleaned} expired unused promo codes`);
                 }
-            } catch (error) {
-                Logger.error('PAYOS', 'Error in periodic promo cleanup', error);
             }
-        }, 24 * 60 * 60 * 1000); // Daily
 
-        // Update statistics hourly
-        setInterval(async () => {
+            return cleaned;
+        } catch (error) {
+            Logger.error('PROMO', 'Error cleaning expired promo codes', error);
+            return 0;
+        }
+    }
+
+    // Get promo code usage history
+    async getPromoCodeUsageHistory(code?: string): Promise<PromoCodeUsage[]> {
+        try {
+            if (code) {
+                return await this.database.getPromoUsage(code.toUpperCase());
+            } else {
+                // Get all usage records
+                const stats = await this.database.getPromoUsageStats();
+                return stats.topDiscounts.map(discount => ({
+                    id: Utils.generateID(),
+                    promoCode: 'VARIOUS',
+                    threadID: discount.threadID,
+                    userID: 'SYSTEM',
+                    planId: 'VARIOUS',
+                    originalAmount: discount.discountAmount * 2, // Approximate
+                    discountedAmount: discount.discountAmount,
+                    discountAmount: discount.discountAmount,
+                    timestamp: discount.timestamp
+                }));
+            }
+        } catch (error) {
+            Logger.error('PROMO', `Error getting promo usage history`, error);
+            return [];
+        }
+    }
+
+    // Validate promo code format
+    static validatePromoCodeFormat(code: string): { isValid: boolean; error?: string } {
+        if (!code || typeof code !== 'string') {
+            return { isValid: false, error: 'Promo code cannot be empty' };
+        }
+
+        if (code.length < 4 || code.length > 20) {
+            return { isValid: false, error: 'Promo code must be 4-20 characters long' };
+        }
+
+        if (!/^[A-Z0-9]+$/.test(code.toUpperCase())) {
+            return { isValid: false, error: 'Promo code can only contain letters and numbers' };
+        }
+
+        return { isValid: true };
+    }
+
+    // Get promo code suggestions based on user behavior
+    async getPromoSuggestions(threadID: string): Promise<PromoCode[]> {
+        try {
+            // Get active promo codes that haven't been used by this thread
+            const allPromoCodes = await this.getAllPromoCodes();
+            const suggestions = [];
+
+            for (const promoCode of allPromoCodes) {
+                if (!promoCode.isActive || new Date() > promoCode.expiryDate) {
+                    continue;
+                }
+
+                if (promoCode.currentUses >= promoCode.maxUses) {
+                    continue;
+                }
+
+                const alreadyUsed = await this.database.checkPromoUsedByThread(promoCode.code, threadID);
+                if (!alreadyUsed) {
+                    suggestions.push(promoCode);
+                }
+            }
+
+            // Sort by value (highest discount first)
+            return suggestions
+                .sort((a, b) => b.value - a.value)
+                .slice(0, 5); // Return top 5 suggestions
+
+        } catch (error) {
+            Logger.error('PROMO', 'Error getting promo suggestions', error);
+            return [];
+        }
+    }
+
+    // Bulk create promo codes
+    async bulkCreatePromoCodes(
+        type: PromoCode['type'],
+        value: number,
+        count: number,
+        maxUses: number,
+        expiryDays: number,
+        createdBy: string,
+        planId?: string,
+        prefix?: string
+    ): Promise<PromoCode[]> {
+        const promoCodes: PromoCode[] = [];
+
+        for (let i = 0; i < count; i++) {
+            const code = (prefix || type.toUpperCase()) + '_' + PromoCodeManager.generateRandomCode(6);
+
             try {
-                await this.saveStatistics();
+                const promoCode = await this.createPromoCode(
+                    code,
+                    type,
+                    value,
+                    maxUses,
+                    expiryDays,
+                    createdBy,
+                    planId,
+                    `Bulk generated ${type} code`
+                );
+
+                promoCodes.push(promoCode);
             } catch (error) {
-                Logger.error('PAYOS', 'Error in periodic stats update', error);
+                Logger.warn('PROMO', `Failed to create bulk promo code ${code}`, error);
             }
-        }, 60 * 60 * 1000); // Hourly
-    }
+        }
 
-    private generateOrderCode(): number {
-        return Math.floor(Math.random() * 9999999) + 1000000;
+        Logger.info('PROMO', `Bulk created ${promoCodes.length}/${count} promo codes`);
+        return promoCodes;
     }
-
-    // ... Rest of existing methods (getThreadSubscription, canUseBot, etc.)
 }

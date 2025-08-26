@@ -1,3 +1,4 @@
+// src/core/UranusBot.ts - Fixed version with proper structure
 import fs from 'fs-extra';
 import path from 'path';
 import { EventEmitter } from 'events';
@@ -7,6 +8,11 @@ import { CommandManager } from './CommandManager';
 import { EventHandler } from './EventHandler';
 import { DatabaseFactory } from '../database/DatabaseFactory';
 import { MessageFactory } from '../utils/MessageFactory';
+import { PayOSManager } from '../integrations/PayOSManager';
+import { PromoCodeManager } from '../integrations/PromoCodeManager';
+import { WebhookServer } from '../integrations/WebhookServer';
+import { AdminDashboard } from '../integrations/AdminDashboard';
+import { EnhancedSQLiteDatabase } from '../database/providers/EnhancedSQLiteDatabase';
 
 export class UranusBot extends EventEmitter {
   private config: BotConfig;
@@ -17,6 +23,13 @@ export class UranusBot extends EventEmitter {
   private database?: DatabaseManager;
   private listening: any = null;
   private startTime: number;
+
+  // Enhanced components
+  private payosManager?: PayOSManager;
+  private promoCodeManager?: PromoCodeManager;
+  private webhookServer?: WebhookServer;
+  private adminDashboard?: AdminDashboard;
+  private enhancedDatabase?: EnhancedSQLiteDatabase;
 
   // Add caching to prevent excessive API calls
   private apiInfoCache = new Map<string, { data: any; timestamp: number }>();
@@ -42,8 +55,14 @@ export class UranusBot extends EventEmitter {
     // Initialize database with proper configuration mapping
     const dbConfig = this.config.database;
 
-    // Map the BotConfig.database to DatabaseFactory expected format
     if (dbConfig.type === 'sqlite') {
+      // Create enhanced SQLite database
+      this.enhancedDatabase = new EnhancedSQLiteDatabase({
+        storage: dbConfig.path || './data/database.sqlite'
+      });
+      await this.enhancedDatabase.initialize();
+
+      // Also create regular database for backwards compatibility
       this.database = await DatabaseFactory.create({
         kind: 'sqlite',
         storage: dbConfig.path || './data/database.sqlite'
@@ -51,6 +70,11 @@ export class UranusBot extends EventEmitter {
     } else {
       // Default to SQLite if unsupported type
       Logger.warn('DATABASE', `Unsupported database type: ${dbConfig.type}, falling back to SQLite`);
+      this.enhancedDatabase = new EnhancedSQLiteDatabase({
+        storage: dbConfig.path || './data/database.sqlite'
+      });
+      await this.enhancedDatabase.initialize();
+
       this.database = await DatabaseFactory.create({
         kind: 'sqlite',
         storage: dbConfig.path || './data/database.sqlite'
@@ -58,6 +82,44 @@ export class UranusBot extends EventEmitter {
     }
 
     Logger.success('DATABASE', 'Database connection established');
+
+    // Initialize PayOS system if enabled
+    if (this.config.payos?.enable && this.enhancedDatabase) {
+      Logger.info('PAYOS', 'Initializing PayOS subscription system...');
+
+      // Initialize PayOS Manager
+      this.payosManager = new PayOSManager(this.enhancedDatabase, this.config);
+
+      // Initialize Promo Code Manager
+      this.promoCodeManager = new PromoCodeManager(this.enhancedDatabase);
+
+      // Make managers available globally for commands
+      (global as any).bot.payosManager = this.payosManager;
+      (global as any).bot.promoCodeManager = this.promoCodeManager;
+
+      // Start webhook server if URL configured
+      if (this.config.payos.webhookUrl) {
+        this.webhookServer = new WebhookServer(this.payosManager, 3000);
+        await this.webhookServer.start();
+        Logger.success('WEBHOOK', 'Webhook server started on port 3000');
+      }
+
+      // Start admin dashboard if enabled
+      if (this.config.features?.dashboard) {
+        const adminToken = process.env.ADMIN_DASHBOARD_TOKEN || 'uranus-admin-2024';
+        this.adminDashboard = new AdminDashboard(
+          this.enhancedDatabase,
+          this.promoCodeManager,
+          adminToken
+        );
+        await this.adminDashboard.start(3001);
+        Logger.success('DASHBOARD', 'Admin dashboard started on port 3001');
+      }
+
+      Logger.success('PAYOS', 'PayOS subscription system initialized');
+    } else if (this.config.payos?.enable) {
+      Logger.warn('PAYOS', 'PayOS enabled but enhanced database not available');
+    }
 
     // Load commands and events
     await this.loadScripts();
@@ -706,6 +768,11 @@ export class UranusBot extends EventEmitter {
         this.listening = null;
       }
 
+      // Stop webhook server
+      if (this.webhookServer) {
+        await this.webhookServer.stop();
+      }
+
       // Clear caches
       this.apiInfoCache.clear();
       this.lastAPICall.clear();
@@ -719,7 +786,12 @@ export class UranusBot extends EventEmitter {
       // Cleanup message factory
       await MessageFactory.shutdown();
 
-      // Close database connections if needed
+      // Close enhanced database connections
+      if (this.enhancedDatabase && typeof (this.enhancedDatabase as any).close === 'function') {
+        await (this.enhancedDatabase as any).close();
+      }
+
+      // Close regular database connections
       if (this.database && typeof (this.database as any).close === 'function') {
         await (this.database as any).close();
       }
@@ -730,7 +802,28 @@ export class UranusBot extends EventEmitter {
     }
   }
 
-  // Getters
+  // Enhanced getters for new components
+  getPayOSManager(): PayOSManager | undefined {
+    return this.payosManager;
+  }
+
+  getPromoCodeManager(): PromoCodeManager | undefined {
+    return this.promoCodeManager;
+  }
+
+  getWebhookServer(): WebhookServer | undefined {
+    return this.webhookServer;
+  }
+
+  getAdminDashboard(): AdminDashboard | undefined {
+    return this.adminDashboard;
+  }
+
+  getEnhancedDatabase(): EnhancedSQLiteDatabase | undefined {
+    return this.enhancedDatabase;
+  }
+
+  // Original getters
   getAPI(): any {
     return this.api;
   }
@@ -763,12 +856,16 @@ export class UranusBot extends EventEmitter {
     return !!(this.api && this.botID && this.database);
   }
 
-  // Health check method
+  // Enhanced health check with subscription system
   getHealthStatus(): {
     status: 'healthy' | 'degraded' | 'unhealthy';
     details: {
       api: boolean;
       database: boolean;
+      enhancedDatabase: boolean;
+      payos: boolean;
+      promoSystem: boolean;
+      webhook: boolean;
       listening: boolean;
       uptime: number;
       cacheSize: number;
@@ -777,6 +874,10 @@ export class UranusBot extends EventEmitter {
     const details = {
       api: !!this.api,
       database: !!this.database,
+      enhancedDatabase: !!this.enhancedDatabase,
+      payos: !!this.payosManager,
+      promoSystem: !!this.promoCodeManager,
+      webhook: !!this.webhookServer,
       listening: !!this.listening,
       uptime: this.getUptime(),
       cacheSize: this.apiInfoCache.size
@@ -786,32 +887,184 @@ export class UranusBot extends EventEmitter {
 
     if (!details.api || !details.database) {
       status = 'unhealthy';
-    } else if (!details.listening) {
+    } else if (!details.listening || (this.config.payos?.enable && (!details.payos || !details.promoSystem))) {
       status = 'degraded';
     }
 
     return { status, details };
   }
 
-  // Get bot statistics
+  // Enhanced stats with subscription metrics
   getStats(): {
     uptime: number;
     commands: number;
     events: number;
     threads: number;
     users: number;
+    subscriptions: {
+      total: number;
+      active: number;
+      expired: number;
+    };
+    revenue: {
+      total: number;
+      thisMonth: number;
+    };
+    promoCodes: {
+      total: number;
+      active: number;
+      used: number;
+    };
     cacheHits: number;
     apiCalls: number;
   } {
-    return {
+    const baseStats = {
       uptime: this.getUptime(),
       commands: this.commandManager.getStats().totalCommands,
       events: this.eventHandler.getEventCount(),
-      threads: 0, // Will be populated by database query if needed
-      users: 0,   // Will be populated by database query if needed
+      threads: 0,
+      users: 0,
+      subscriptions: {
+        total: 0,
+        active: 0,
+        expired: 0
+      },
+      revenue: {
+        total: 0,
+        thisMonth: 0
+      },
+      promoCodes: {
+        total: 0,
+        active: 0,
+        used: 0
+      },
       cacheHits: this.apiInfoCache.size,
       apiCalls: this.lastAPICall.size
     };
+
+    // Get subscription stats asynchronously if available
+    if (this.enhancedDatabase) {
+      this.enhancedDatabase.getSubscriptionStats()
+        .then(stats => {
+          baseStats.subscriptions = {
+            total: stats.total,
+            active: stats.active,
+            expired: stats.expired
+          };
+        })
+        .catch(error => {
+          Logger.debug('STATS', 'Could not load subscription stats', error);
+        });
+
+      this.enhancedDatabase.getRevenueAnalytics(30)
+        .then(analytics => {
+          baseStats.revenue = {
+            total: analytics.totalRevenue,
+            thisMonth: analytics.totalRevenue // Simplified
+          };
+        })
+        .catch(error => {
+          Logger.debug('STATS', 'Could not load revenue analytics', error);
+        });
+    }
+
+    if (this.promoCodeManager) {
+      this.promoCodeManager.getPromoCodeStats()
+        .then(stats => {
+          baseStats.promoCodes = {
+            total: stats.totalCodes,
+            active: stats.activeCodes,
+            used: stats.totalUses
+          };
+        })
+        .catch(error => {
+          Logger.debug('STATS', 'Could not load promo stats', error);
+        });
+    }
+
+    return baseStats;
+  }
+
+  // Method to handle subscription validation for commands
+  async validateSubscriptionForCommand(threadID: string, commandName: string): Promise<{
+    canExecute: boolean;
+    reason?: string;
+    message?: string;
+  }> {
+    if (!this.payosManager) {
+      return { canExecute: true }; // No subscription system, allow all commands
+    }
+
+    const { canUse, reason, subscription } = await this.payosManager.canUseBot(threadID);
+
+    if (!canUse) {
+      const prefix = this.config.prefix;
+      let message = '';
+
+      switch (reason) {
+        case 'NO_SUBSCRIPTION':
+          message = `🔒 This command requires an active subscription.\nUse \`${prefix}subscribe\` to get started!`;
+          break;
+        case 'SUBSCRIPTION_EXPIRED':
+          message = `⏰ Your subscription has expired.\nUse \`${prefix}renew\` to reactivate with discount!`;
+          break;
+        case 'SUBSCRIPTION_INACTIVE':
+          message = `⚠️ Your subscription is inactive.\nContact support or use \`${prefix}renew\` to reactivate.`;
+          break;
+        default:
+          message = `❌ Unable to verify subscription status.\nUse \`${prefix}status\` to check your subscription.`;
+      }
+
+      return {
+        canExecute: false,
+        reason,
+        message
+      };
+    }
+
+    return { canExecute: true };
+  }
+
+  // Method to send subscription notifications
+  async sendSubscriptionNotification(threadID: string, type: 'activation' | 'expiry' | 'renewal', data: any): Promise<void> {
+    try {
+      if (!this.api) return;
+
+      let message = '';
+      const prefix = this.config.prefix;
+
+      switch (type) {
+        case 'activation':
+          message = `🎉 **Subscription Activated!**\n\n` +
+            `✅ **${data.planName}** is now active\n` +
+            `⏰ **Duration:** ${data.days} days\n` +
+            `🤖 **All bot features unlocked!**\n\n` +
+            `💡 Use \`${prefix}help\` to explore commands`;
+          break;
+
+        case 'expiry':
+          message = `⚠️ **Subscription Expiring Soon!**\n\n` +
+            `📅 **${data.daysLeft} days remaining**\n` +
+            `🎉 **Renew now and save ${data.discount}%!**\n` +
+            `Use \`${prefix}renew\` to extend`;
+          break;
+
+        case 'renewal':
+          message = `🔄 **Subscription Renewed!**\n\n` +
+            `✅ **${data.planName}** extended\n` +
+            `⏰ **New expiry:** ${data.newExpiryDate}\n` +
+            `💰 **Amount paid:** ${data.amount}đ`;
+          break;
+      }
+
+      if (message) {
+        await this.api.sendMessage(message, threadID);
+        Logger.info('NOTIFICATION', `Sent ${type} notification to thread ${threadID}`);
+      }
+
+    } catch (error) {
+      Logger.error('NOTIFICATION', `Failed to send ${type} notification to thread ${threadID}`, error);
+    }
   }
 
   // Method to manually clear API cache if needed

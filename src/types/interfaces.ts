@@ -4,7 +4,7 @@ export interface BotConfig {
   language: string;
   database: DatabaseConfig;
   facebook: FacebookConfig;
-  payos?: PayOSConfig;
+  payos?: PayOSConfig; // Make it optional
   features: FeatureConfig;
 }
 
@@ -28,8 +28,15 @@ export interface PayOSConfig {
   clientId: string;
   apiKey: string;
   checksumKey: string;
-  webhookUrl?: string;
-  packages: Record<string, PackageInfo>;
+  webhookUrl: string;
+  packages: Record<string, {
+    name: string;
+    price: number;
+    days: number;
+    description: string;
+    features?: string[];
+    renewalDiscount?: number;
+  }>;
 }
 
 export interface PackageInfo {
@@ -42,7 +49,7 @@ export interface PackageInfo {
 export interface FeatureConfig {
   autoRestart: boolean;
   antiInbox: boolean;
-  dashboard: boolean;
+  dashboard: boolean; // Admin dashboard
   autoLoadScripts: boolean;
 }
 

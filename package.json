@@ -17,7 +17,12 @@
     "test": "echo \"Tests not implemented yet\"",
     "migration": "tsx scripts/migrate.ts"
   },
-  "keywords": ["bot", "facebook", "messenger", "typescript"],
+  "keywords": [
+    "bot",
+    "facebook",
+    "messenger",
+    "typescript"
+  ],
   "author": "Uranus Bot Team",
   "license": "MIT",
   "engines": {
@@ -28,16 +33,21 @@
     "@google/generative-ai": "^0.24.1",
     "@payos/node": "^1.0.10",
     "axios": "^1.7.2",
+    "axios-cookiejar-support": "^6.0.4",
     "bcrypt": "^5.1.0",
     "canvas": "^2.11.2",
     "chalk": "^4.1.2",
     "cheerio": "^1.0.0-rc.12",
-    "express": "^4.19.2",
+    "deepdash": "^5.3.9",
+    "express": "^4.21.2",
     "fs-extra": "^11.2.0",
+    "jsonpath-plus": "^10.3.0",
     "lodash": "^4.17.21",
     "moment-timezone": "^0.5.45",
     "sequelize": "^6.37.3",
     "sqlite3": "^5.1.6",
+    "tough-cookie": "^6.0.0",
+    "websocket-stream": "^5.5.2",
     "winston": "^3.13.0"
   },
   "devDependencies": {
