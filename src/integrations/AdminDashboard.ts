@@ -1,9 +1,8 @@
 // src/integrations/AdminDashboard.ts
 import express from 'express';
-import { EnhancedSQLiteDatabase } from '../database/providers/EnhancedSQLiteDatabase';
+import { EnhancedSQLiteDatabase, SubscriptionData, TransactionData } from '../database/providers/EnhancedSQLiteDatabase';
 import { PromoCodeManager } from './PromoCodeManager';
 import { Logger } from '../utils/Logger';
-import { Utils } from '../utils/Utils';
 
 export class AdminDashboard {
     private app: express.Application;
@@ -30,22 +29,23 @@ export class AdminDashboard {
         this.app.use(express.urlencoded({ extended: true }));
 
         // CORS
-        this.app.use((req, res, next) => {
+        this.app.use((_req, res, next) => {
             res.header('Access-Control-Allow-Origin', '*');
             res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
             res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-            if (req.method === 'OPTIONS') {
-                res.sendStatus(200);
-            } else {
-                next();
-            }
+            next();
+        });
+
+        // Handle OPTIONS requests
+        this.app.options('*', (_req, res) => {
+            res.sendStatus(200);
         });
 
         // Auth middleware
         this.app.use('/api/admin', this.authenticateAdmin.bind(this));
 
         // Request logging
-        this.app.use((req, res, next) => {
+        this.app.use((req, _res, next) => {
             Logger.debug('DASHBOARD', `${req.method} ${req.path}`, {
                 query: req.query,
                 body: req.method === 'POST' || req.method === 'PUT' ? req.body : undefined
@@ -73,7 +73,7 @@ export class AdminDashboard {
 
     private setupRoutes(): void {
         // Health check
-        this.app.get('/health', async (req, res) => {
+        this.app.get('/health', async (_req, res) => {
             try {
                 const health = await this.database.healthCheck();
                 res.json({
@@ -121,14 +121,14 @@ export class AdminDashboard {
         this.app.post('/api/admin/system/backup', this.createBackup.bind(this));
 
         // Error handler
-        this.app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+        this.app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
             Logger.error('DASHBOARD', 'API error', error);
             res.status(500).json({ error: 'Internal server error' });
         });
     }
 
     // Dashboard overview
-    private async getDashboardOverview(req: express.Request, res: express.Response): Promise<void> {
+    private async getDashboardOverview(_req: express.Request, res: express.Response): Promise<void> {
         try {
             const [
                 subscriptionStats,
@@ -192,7 +192,7 @@ export class AdminDashboard {
         try {
             const { status = 'all', page = 1, limit = 20, search } = req.query;
 
-            let subscriptions;
+            let subscriptions: SubscriptionData[];
 
             switch (status) {
                 case 'active':
@@ -202,8 +202,12 @@ export class AdminDashboard {
                     subscriptions = await this.database.getExpiredSubscriptions();
                     break;
                 default:
-                    // Get all subscriptions - would need implementation
-                    subscriptions = [];
+                    // Get all subscriptions - combine active and expired
+                    const [active, expired] = await Promise.all([
+                        this.database.getActiveSubscriptions(),
+                        this.database.getExpiredSubscriptions()
+                    ]);
+                    subscriptions = [...active, ...expired];
             }
 
             // Apply search filter if provided
@@ -321,6 +325,33 @@ export class AdminDashboard {
         }
     }
 
+    private async deactivateSubscription(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { threadId } = req.params;
+            const { reason } = req.body;
+
+            const success = await this.database.updateSubscription(threadId, {
+                isActive: false
+            });
+
+            if (success) {
+                Logger.info('DASHBOARD', `Admin deactivated subscription for thread ${threadId}`, {
+                    reason
+                });
+
+                res.json({
+                    success: true,
+                    message: `Subscription deactivated for thread ${threadId}`
+                });
+            } else {
+                res.status(404).json({ error: 'Subscription not found' });
+            }
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error deactivating subscription', error);
+            res.status(500).json({ error: 'Failed to deactivate subscription' });
+        }
+    }
+
     private async extendSubscription(req: express.Request, res: express.Response): Promise<void> {
         try {
             const { threadId } = req.params;
@@ -378,15 +409,35 @@ export class AdminDashboard {
         }
     }
 
+    private async getSubscriptionStats(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { days = 30 } = req.query;
+            const stats = await this.database.getSubscriptionStats();
+            const analytics = await this.database.getRevenueAnalytics(parseInt(days as string) || 30);
+
+            res.json({
+                ...stats,
+                analytics: {
+                    renewalRate: analytics.renewalRate,
+                    churnRate: analytics.churnRate,
+                    lifetimeValue: analytics.lifetimeValue,
+                    monthlyGrowth: analytics.monthlyGrowth
+                }
+            });
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error getting subscription stats', error);
+            res.status(500).json({ error: 'Failed to load subscription stats' });
+        }
+    }
+
     // Transaction management endpoints
     private async getTransactions(req: express.Request, res: express.Response): Promise<void> {
         try {
-            const { status = 'all', page = 1, limit = 20, days = 30 } = req.query;
-
+            const { days = 30 } = req.query;
             const stats = await this.database.getTransactionStats(parseInt(days as string));
 
             res.json({
-                transactions: stats.dailyStats, // This would need enhancement to return actual transactions
+                transactions: stats.dailyStats,
                 summary: {
                     total: stats.total,
                     successful: stats.successful,
@@ -399,6 +450,75 @@ export class AdminDashboard {
         } catch (error) {
             Logger.error('DASHBOARD', 'Error getting transactions', error);
             res.status(500).json({ error: 'Failed to load transactions' });
+        }
+    }
+
+    private async getTransactionDetails(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { orderCode } = req.params;
+            const orderCodeNum = parseInt(orderCode);
+
+            if (isNaN(orderCodeNum)) {
+                res.status(400).json({ error: 'Invalid order code' });
+                return;
+            }
+
+            const transaction = await this.database.getTransactionByOrderCode(orderCodeNum);
+
+            if (!transaction) {
+                res.status(404).json({ error: 'Transaction not found' });
+                return;
+            }
+
+            res.json({ transaction });
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error getting transaction details', error);
+            res.status(500).json({ error: 'Failed to load transaction details' });
+        }
+    }
+
+    private async updateTransactionStatus(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { orderCode } = req.params;
+            const { status } = req.body;
+            const orderCodeNum = parseInt(orderCode);
+
+            if (isNaN(orderCodeNum)) {
+                res.status(400).json({ error: 'Invalid order code' });
+                return;
+            }
+
+            if (!['pending', 'success', 'failed', 'cancelled'].includes(status)) {
+                res.status(400).json({ error: 'Invalid status' });
+                return;
+            }
+
+            const completedAt = status === 'success' ? new Date() : undefined;
+            const success = await this.database.updateTransactionStatus(orderCodeNum, status, completedAt);
+
+            if (success) {
+                res.json({
+                    success: true,
+                    message: `Transaction status updated to ${status}`
+                });
+            } else {
+                res.status(404).json({ error: 'Transaction not found' });
+            }
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error updating transaction status', error);
+            res.status(500).json({ error: 'Failed to update transaction status' });
+        }
+    }
+
+    private async getTransactionStats(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { days = 30 } = req.query;
+            const stats = await this.database.getTransactionStats(parseInt(days as string));
+
+            res.json(stats);
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error getting transaction stats', error);
+            res.status(500).json({ error: 'Failed to load transaction stats' });
         }
     }
 
@@ -500,6 +620,64 @@ export class AdminDashboard {
         }
     }
 
+    private async deactivatePromoCode(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { code } = req.params;
+            const { reason } = req.body;
+
+            const success = await this.promoManager.deactivatePromoCode(code);
+
+            if (success) {
+                Logger.info('DASHBOARD', `Admin deactivated promo code ${code}`, { reason });
+
+                res.json({
+                    success: true,
+                    message: `Promo code ${code} deactivated successfully`
+                });
+            } else {
+                res.status(404).json({ error: 'Promo code not found' });
+            }
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error deactivating promo code', error);
+            res.status(500).json({ error: 'Failed to deactivate promo code' });
+        }
+    }
+
+    private async getPromoCodeUsage(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { code } = req.params;
+            const usage = await this.promoManager.getPromoCodeUsageHistory(code);
+
+            res.json({
+                promoCode: code,
+                usage,
+                summary: {
+                    totalUses: usage.length,
+                    totalSavings: usage.reduce((sum, u) => sum + u.discountAmount, 0),
+                    uniqueThreads: new Set(usage.map(u => u.threadID)).size
+                }
+            });
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error getting promo code usage', error);
+            res.status(500).json({ error: 'Failed to load promo code usage' });
+        }
+    }
+
+    private async getPromoCodeStats(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const stats = await this.promoManager.getPromoCodeStats();
+            const detailedStats = await this.database.getPromoUsageStats();
+
+            res.json({
+                ...stats,
+                detailed: detailedStats
+            });
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error getting promo code stats', error);
+            res.status(500).json({ error: 'Failed to load promo code stats' });
+        }
+    }
+
     // Analytics endpoints
     private async getRevenueAnalytics(req: express.Request, res: express.Response): Promise<void> {
         try {
@@ -510,6 +688,79 @@ export class AdminDashboard {
         } catch (error) {
             Logger.error('DASHBOARD', 'Error getting revenue analytics', error);
             res.status(500).json({ error: 'Failed to load revenue analytics' });
+        }
+    }
+
+    private async getCustomerAnalytics(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { days = 30 } = req.query;
+
+            // Get subscription and transaction data to analyze customer behavior
+            const [subscriptionStats, transactionStats] = await Promise.all([
+                this.database.getSubscriptionStats(),
+                this.database.getTransactionStats(parseInt(days as string))
+            ]);
+
+            const customerAnalytics = {
+                acquisition: {
+                    newSubscriptions: subscriptionStats.total - subscriptionStats.expired,
+                    trialConversions: subscriptionStats.total - subscriptionStats.trials,
+                    conversionRate: subscriptionStats.trials > 0 ?
+                        ((subscriptionStats.total - subscriptionStats.trials) / subscriptionStats.trials * 100).toFixed(1) + '%' : '0%'
+                },
+                retention: {
+                    activeCustomers: subscriptionStats.active,
+                    churnedCustomers: subscriptionStats.expired,
+                    retentionRate: subscriptionStats.total > 0 ?
+                        (subscriptionStats.active / subscriptionStats.total * 100).toFixed(1) + '%' : '0%'
+                },
+                revenue: {
+                    averageOrderValue: transactionStats.averageOrderValue,
+                    totalRevenue: transactionStats.totalRevenue,
+                    revenuePerCustomer: subscriptionStats.active > 0 ?
+                        Math.round(transactionStats.totalRevenue / subscriptionStats.active) : 0
+                },
+                plans: subscriptionStats.planDistribution
+            };
+
+            res.json(customerAnalytics);
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error getting customer analytics', error);
+            res.status(500).json({ error: 'Failed to load customer analytics' });
+        }
+    }
+
+    private async getPlanAnalytics(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const stats = await this.database.getSubscriptionStats();
+            const transactionStats = await this.database.getTransactionStats(30);
+
+            // Calculate plan-specific metrics
+            const planAnalytics = Object.entries(stats.planDistribution).map(([planId, count]) => ({
+                planId,
+                subscriptions: count,
+                marketShare: stats.total > 0 ? ((count as number) / stats.total * 100).toFixed(1) + '%' : '0%',
+                // Additional metrics would require more complex queries
+                averageLifetime: 0,
+                renewalRate: 0
+            }));
+
+            res.json({
+                planBreakdown: planAnalytics,
+                totalPlans: Object.keys(stats.planDistribution).length,
+                mostPopular: Object.entries(stats.planDistribution)
+                    .reduce((max, [planId, count]) =>
+                        (count as number) > (max.count as number) ? { planId, count } : max,
+                        { planId: '', count: 0 }
+                    ),
+                revenue: {
+                    totalRevenue: transactionStats.totalRevenue,
+                    averageOrderValue: transactionStats.averageOrderValue
+                }
+            });
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error getting plan analytics', error);
+            res.status(500).json({ error: 'Failed to load plan analytics' });
         }
     }
 
@@ -575,6 +826,54 @@ export class AdminDashboard {
         }
     }
 
+    private async createBackup(req: express.Request, res: express.Response): Promise<void> {
+        try {
+            const { includeTransactions = true, includePromoCodes = true } = req.body;
+
+            const backup: any = {
+                timestamp: new Date().toISOString(),
+                version: '1.0.0',
+                metadata: {
+                    generatedBy: 'admin-dashboard',
+                    includes: {
+                        subscriptions: true,
+                        transactions: includeTransactions,
+                        promoCodes: includePromoCodes
+                    }
+                }
+            };
+
+            // Always include subscriptions
+            const subscriptionData = await this.database.exportSubscriptionData();
+            backup.subscriptions = subscriptionData.subscriptions;
+
+            if (includeTransactions) {
+                backup.transactions = subscriptionData.transactions;
+            }
+
+            if (includePromoCodes) {
+                backup.promoCodes = await this.promoManager.getAllPromoCodes();
+                backup.promoUsage = subscriptionData.promoUsage;
+            }
+
+            const filename = `uranus-bot-backup-${new Date().toISOString().split('T')[0]}-${Date.now()}.json`;
+
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+            res.json(backup);
+
+            Logger.info('DASHBOARD', 'Generated backup file', {
+                filename,
+                subscriptions: backup.subscriptions?.length || 0,
+                transactions: backup.transactions?.length || 0,
+                promoCodes: backup.promoCodes?.length || 0
+            });
+        } catch (error) {
+            Logger.error('DASHBOARD', 'Error creating backup', error);
+            res.status(500).json({ error: 'Failed to create backup' });
+        }
+    }
+
     public getApp(): express.Application {
         return this.app;
     }
@@ -594,50 +893,5 @@ export class AdminDashboard {
                 resolve();
             });
         });
-    }
-
-    // Additional helper methods would go here...
-    private async getSubscriptionStats(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async getTransactionDetails(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async updateTransactionStatus(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async getTransactionStats(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async deactivateSubscription(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async deactivatePromoCode(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async getPromoCodeUsage(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async getPromoCodeStats(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async getCustomerAnalytics(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async getPlanAnalytics(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
-    }
-
-    private async createBackup(req: express.Request, res: express.Response): Promise<void> {
-        // Implementation
     }
 }

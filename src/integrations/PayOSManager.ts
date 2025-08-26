@@ -2,8 +2,7 @@
 import PayOS from '@payos/node';
 import { Logger } from '../utils/Logger';
 import { Utils } from '../utils/Utils';
-import { DatabaseManager } from '../types/interfaces';
-import { EnhancedSQLiteDatabase } from '../database/providers/EnhancedSQLiteDatabase';
+import { EnhancedSQLiteDatabase, TransactionData, SubscriptionData } from '../database/providers/EnhancedSQLiteDatabase';
 
 export interface SubscriptionPlan {
     id: string;
@@ -56,10 +55,11 @@ export interface PaymentData {
     status: 'pending' | 'success' | 'failed' | 'cancelled';
     timestamp: Date;
     metadata: Record<string, any>;
+    paymentMethod: 'payos' | 'manual' | 'promo';
 }
 
 export class PayOSManager {
-    private payos: PayOS;
+    private payos?: PayOS; // Made optional since it might not be initialized
     private database: EnhancedSQLiteDatabase;
     private config: any;
     private subscriptionPlans: Map<string, SubscriptionPlan> = new Map();
@@ -115,6 +115,8 @@ export class PayOSManager {
                 config.payos.checksumKey
             );
             Logger.info('PAYOS', 'PayOS initialized successfully');
+        } else {
+            Logger.info('PAYOS', 'PayOS disabled in configuration');
         }
 
         this.loadSubscriptionPlans();
@@ -173,7 +175,8 @@ export class PayOSManager {
     // Get thread subscription details
     async getThreadSubscription(threadID: string): Promise<ThreadSubscription | null> {
         try {
-            return await this.database.getSubscriptionByThread(threadID);
+            const subscription = await this.database.getSubscriptionByThread(threadID);
+            return subscription as ThreadSubscription | null;
         } catch (error) {
             Logger.error('PAYOS', 'Error getting subscription', error);
             return null;
@@ -265,36 +268,39 @@ export class PayOSManager {
 
         const orderCode = this.generateOrderCode();
 
-        const paymentData: PaymentData = {
+        // Create proper TransactionData object matching the interface
+        const transactionData: Omit<TransactionData, 'id'> = {
             orderCode,
-            amount: finalAmount,
-            description: isRenewal
-                ? `Gia hạn ${plan.name} cho nhóm ${threadID}`
-                : `Đăng ký ${plan.name} cho nhóm ${threadID}`,
             threadID,
-            planId,
             userID,
-            isRenewal,
+            planId,
+            amount: finalAmount,
             originalAmount: plan.price,
             discountAmount,
-            promoCode: appliedPromoCode,
-            totalDays: plan.days + bonusDays,
+            promoCode: appliedPromoCode || undefined,
             status: 'pending',
+            paymentMethod: 'payos',
             timestamp: new Date(),
+            completedAt: undefined,
             metadata: {
+                description: isRenewal
+                    ? `Gia hạn ${plan.name} cho nhóm ${threadID}`
+                    : `Đăng ký ${plan.name} cho nhóm ${threadID}`,
+                isRenewal,
                 bonusDays,
+                totalDays: plan.days + bonusDays,
                 renewalDiscount: isRenewal ? plan.renewalDiscount : 0,
                 features: plan.features
             }
         };
 
         // Store payment data in database
-        await this.database.createTransaction(paymentData);
+        await this.database.createTransaction(transactionData);
 
         const body = {
             orderCode,
             amount: finalAmount,
-            description: paymentData.description,
+            description: transactionData.metadata.description,
             items: [
                 {
                     name: plan.name + (bonusDays ? ` + ${bonusDays} bonus days` : ''),
@@ -332,6 +338,10 @@ export class PayOSManager {
     // Handle successful payment webhook
     async handlePaymentSuccess(orderCode: number): Promise<boolean> {
         try {
+            if (!this.payos) {
+                throw new Error('PayOS not initialized');
+            }
+
             // Verify payment with PayOS
             const paymentInfo = await this.payos.getPaymentLinkInformation(orderCode);
 
@@ -351,10 +361,8 @@ export class PayOSManager {
             // Update transaction status
             await this.database.updateTransactionStatus(orderCode, 'success', new Date());
 
-            // Calculate bonus days
-            const bonusDays = transaction.totalDays
-                ? transaction.totalDays - this.subscriptionPlans.get(transaction.planId)!.days
-                : 0;
+            // Calculate bonus days from metadata
+            const bonusDays = transaction.metadata?.bonusDays || 0;
 
             // Activate subscription
             await this.activateSubscription(
@@ -438,7 +446,7 @@ export class PayOSManager {
             timestamp: now
         };
 
-        const subscriptionData = {
+        const subscriptionData: Omit<SubscriptionData, 'id'> = {
             threadID,
             planId,
             startDate: existingSubscription?.startDate || now,
@@ -486,7 +494,7 @@ export class PayOSManager {
             promoCode
         });
 
-        return subscription;
+        return subscription as ThreadSubscription;
     }
 
     // Deactivate expired subscription
@@ -646,7 +654,7 @@ export class PayOSManager {
         }
     }
 
-    // Get subscription statistics
+    // Get subscription statistics - fixed return type
     async getSubscriptionStats(): Promise<{
         totalSubscriptions: number;
         activeSubscriptions: number;
@@ -655,7 +663,15 @@ export class PayOSManager {
         planStats: Record<string, number>;
     }> {
         try {
-            return await this.database.getSubscriptionStats();
+            const stats = await this.database.getSubscriptionStats();
+
+            return {
+                totalSubscriptions: stats.total,
+                activeSubscriptions: stats.active,
+                expiredSubscriptions: stats.expired,
+                totalRevenue: stats.totalRevenue,
+                planStats: stats.planDistribution
+            };
         } catch (error) {
             Logger.error('PAYOS', 'Error getting subscription statistics', error);
             return {
@@ -793,10 +809,29 @@ export class PayOSManager {
         }
     }
 
-    // Get transaction history for thread
+    // Get transaction history for thread - fixed return type
     async getTransactionHistory(threadID: string, limit: number = 10): Promise<PaymentData[]> {
         try {
-            return await this.database.getTransactionsByThread(threadID, limit);
+            const transactions = await this.database.getTransactionsByThread(threadID, limit);
+
+            // Convert TransactionData to PaymentData format
+            return transactions.map((transaction): PaymentData => ({
+                orderCode: transaction.orderCode,
+                amount: transaction.amount,
+                description: transaction.metadata?.description || `Transaction ${transaction.orderCode}`,
+                threadID: transaction.threadID,
+                planId: transaction.planId,
+                userID: transaction.userID,
+                isRenewal: transaction.metadata?.isRenewal || false,
+                originalAmount: transaction.originalAmount,
+                discountAmount: transaction.discountAmount,
+                promoCode: transaction.promoCode,
+                totalDays: transaction.metadata?.totalDays,
+                status: transaction.status,
+                timestamp: transaction.timestamp,
+                metadata: transaction.metadata,
+                paymentMethod: transaction.paymentMethod
+            }));
         } catch (error) {
             Logger.error('PAYOS', `Error getting transaction history for thread ${threadID}`, error);
             return [];
