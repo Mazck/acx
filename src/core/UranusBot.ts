@@ -45,18 +45,28 @@ export class UranusBot extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    // Fix: Use correct import for facebook-chat-api
     const { login } = require('../../facebook-chat-api');
-    
+
     return new Promise((resolve, reject) => {
       const appStatePath = path.join(process.cwd(), 'appstate.json');
-      
+
       if (!fs.existsSync(appStatePath)) {
-        reject(new Error('appstate.json not found'));
+        reject(new Error('appstate.json not found. Please create appstate.json file with your Facebook session data.'));
         return;
       }
 
-      const appState = fs.readJsonSync(appStatePath);
-      
+      let appState;
+      try {
+        appState = fs.readJsonSync(appStatePath);
+        if (!Array.isArray(appState) || appState.length === 0) {
+          throw new Error('Invalid appstate format');
+        }
+      } catch (error) {
+        reject(new Error('Invalid appstate.json format. Please check your appstate file.'));
+        return;
+      }
+
       login({ appState }, this.config.facebook.options, async (error: any, api: any) => {
         if (error) {
           Logger.error('LOGIN', 'Failed to login to Facebook', error);
@@ -66,7 +76,7 @@ export class UranusBot extends EventEmitter {
 
         this.api = api;
         this.botID = api.getCurrentUserID();
-        
+
         Logger.success('LOGIN', `Logged in as ${this.botID}`);
         Logger.info('BOT_INFO', `Bot ID: ${this.botID}`);
         Logger.info('BOT_INFO', `Prefix: ${this.config.prefix}`);
@@ -74,7 +84,7 @@ export class UranusBot extends EventEmitter {
 
         // Start listening for messages
         this.startListening();
-        
+
         resolve();
       });
     });
@@ -99,70 +109,269 @@ export class UranusBot extends EventEmitter {
 
   private async handleEvent(event: Event): Promise<void> {
     try {
+      // Enhanced event validation and processing
+      const processedEvent = this.validateAndProcessEvent(event);
+      if (!processedEvent) {
+        return; // Skip invalid events
+      }
+
       // Anti-inbox check
-      if (this.config.features.antiInbox && !event.isGroup) {
+      if (this.config.features.antiInbox && !processedEvent.isGroup) {
         return;
       }
 
       // Create message object
-      const message = MessageFactory.create(this.api, event);
+      const message = MessageFactory.create(this.api, processedEvent);
 
-      // Check and create user/thread data if needed
-      await this.ensureDataExists(event);
+      // Ensure data exists with better error handling
+      await this.ensureDataExists(processedEvent);
 
       // Handle the event
-      await this.eventHandler.handle(event, message, this.database);
+      if (this.database) {
+        await this.eventHandler.handle(processedEvent, message, this.database);
+      }
 
     } catch (error) {
       Logger.error('EVENT_HANDLER', 'Error handling event', error);
+      // Don't throw - continue processing other events
     }
   }
 
-  private async ensureDataExists(event: any): Promise<void> {
-    const userID = String(event?.senderID || event?.sender?.id || "");
-    const threadID = String(event?.threadID || event?.thread?.id || "");
-    if (!userID || !threadID) {
-      Logger.warn('[EVENT] ',"Missing senderID or threadID");
+  // Enhanced event validation and processing
+  private validateAndProcessEvent(event: any): Event | null {
+    try {
+      // Extract and normalize event data
+      const processedEvent: Event = {
+        type: event.type || 'message',
+        threadID: this.extractThreadID(event),
+        senderID: this.extractSenderID(event),
+        messageID: event.messageID,
+        body: event.body,
+        isGroup: this.determineIsGroup(event),
+        attachments: event.attachments || [],
+        mentions: event.mentions || [],
+        messageReply: event.messageReply,
+        logMessageType: event.logMessageType,
+        logMessageData: event.logMessageData,
+        participantIDs: event.participantIDs,
+        threadName: event.threadName,
+        senderName: event.senderName,
+        author: event.author,
+        ...event // Keep other properties
+      };
+
+      // Validate required fields
+      if (!processedEvent.threadID) {
+        Logger.warn('EVENT_VALIDATION', 'Missing threadID in event', {
+          type: event.type,
+          logMessageType: event.logMessageType,
+          availableKeys: Object.keys(event)
+        });
+        return null;
+      }
+
+      Logger.debug('EVENT_VALIDATION', 'Processed event', {
+        type: processedEvent.type,
+        threadID: processedEvent.threadID,
+        senderID: processedEvent.senderID,
+        isGroup: processedEvent.isGroup,
+        logMessageType: processedEvent.logMessageType
+      });
+
+      return processedEvent;
+    } catch (error) {
+      Logger.error('EVENT_VALIDATION', 'Error processing event', error);
+      return null;
+    }
+  }
+
+  // Extract threadID from various event formats
+  private extractThreadID(event: any): string {
+    return String(
+      event.threadID ||
+      event.thread?.id ||
+      event.threadId ||
+      event.chatId ||
+      ''
+    );
+  }
+
+  // Extract senderID from various event formats
+  private extractSenderID(event: any): string {
+    return String(
+      event.senderID ||
+      event.sender?.id ||
+      event.senderId ||
+      event.author ||
+      event.userID ||
+      ''
+    );
+  }
+
+  // Determine if event is from group chat
+  private determineIsGroup(event: any): boolean {
+    // Check explicit isGroup field
+    if (event.isGroup !== undefined) {
+      return event.isGroup;
+    }
+
+    // Check thread type indicators
+    if (event.threadType === 'GROUP') return true;
+    if (event.threadType === 'USER') return false;
+
+    // Check participant count
+    if (event.participantIDs && event.participantIDs.length > 2) {
+      return true;
+    }
+
+    // Default to group for safety (most Facebook chats are groups)
+    return true;
+  }
+
+  // Enhanced ensureDataExists with better error handling
+  private async ensureDataExists(event: Event): Promise<void> {
+    if (!this.database) {
+      Logger.warn('EVENT', 'Database not initialized');
       return;
     }
 
-    // USER
-    let user = await this.database.users.get(userID);
-    if (!user) {
-      try {
-        user = await this.database.users.create(userID, {
-          name: event?.senderName || `User${userID}`,
-        });
-      } catch (e) {
-        // Trường hợp lock hoặc race: đọc lại
-        Logger.warn('[ensureDataExists]',` create user failed: ${String(e)}`);
-        user = await this.database.users.get(userID);
-      }
-    }
+    const { threadID, senderID } = event;
 
-    // THREAD
-    let thread = await this.database.threads.get(threadID);
-    if (!thread) {
-      try {
-        thread = await this.database.threads.create(threadID, {
-          threadName: event?.threadName || `Thread${threadID}`,
-          isGroup: event?.isGroup !== false,
-        });
-      } catch (e) {
-        Logger.warn('[ensureDataExists]', ` create thread failed: ${String(e)}`);
-        thread = await this.database.threads.get(threadID);
-      }
-    }
+    try {
+      // Always ensure thread exists first
+      await this.ensureThreadExists(threadID, event);
 
-    if (!user || !thread) {
-      Logger.warn('EVENT',"Missing user or thread data");
+      // Ensure user exists if we have senderID
+      if (senderID) {
+        await this.ensureUserExists(senderID, event);
+      }
+
+    } catch (error) {
+      Logger.error('EVENT', 'Error in ensureDataExists', {
+        error: error.message,
+        threadID,
+        senderID,
+        eventType: event.type
+      });
+      // Don't throw - allow event processing to continue
     }
   }
 
+  // Ensure thread exists with comprehensive data
+  private async ensureThreadExists(threadID: string, event: Event): Promise<void> {
+    try {
+      let thread = await this.database!.threads.get(threadID);
+
+      if (!thread) {
+        // Get thread info from Facebook API if possible
+        let threadInfo: any = {};
+
+        try {
+          if (this.api && this.api.getThreadInfo) {
+            threadInfo = await this.api.getThreadInfo(threadID);
+            Logger.debug('THREAD_CREATION', 'Retrieved thread info from API', {
+              threadID,
+              threadName: threadInfo.threadName
+            });
+          }
+        } catch (apiError) {
+          Logger.warn('THREAD_CREATION', 'Could not get thread info from API', {
+            threadID,
+            error: apiError.message
+          });
+        }
+
+        // Create thread with available data
+        const threadData = {
+          threadName: threadInfo.threadName ||
+            event.threadName ||
+            `Thread${threadID}`,
+          isGroup: event.isGroup,
+          adminIDs: threadInfo.adminIDs ||
+            event.adminIDs ||
+            [],
+          members: threadInfo.participantIDs?.map((id: string) => ({
+            userID: id,
+            name: `User${id}`,
+            inGroup: true,
+            count: 0
+          })) || [],
+          participantIDs: threadInfo.participantIDs ||
+            event.participantIDs ||
+            []
+        };
+
+        thread = await this.database!.threads.create(threadID, threadData);
+
+        Logger.info('THREAD_CREATION', `Created new thread: ${threadID}`, {
+          threadName: threadData.threadName,
+          isGroup: threadData.isGroup,
+          memberCount: threadData.members.length
+        });
+      }
+
+      // Update thread activity
+      if (thread) {
+        await this.database!.threads.set(threadID, { isActive: true }, 'isActive');
+      }
+
+    } catch (error) {
+      Logger.error('THREAD_CREATION', `Failed to ensure thread ${threadID}`, error);
+      throw error;
+    }
+  }
+
+  // Ensure user exists with comprehensive data
+  private async ensureUserExists(senderID: string, event: Event): Promise<void> {
+    try {
+      let user = await this.database!.users.get(senderID);
+
+      if (!user) {
+        // Get user info from Facebook API if possible
+        let userInfo: any = {};
+
+        try {
+          if (this.api && this.api.getUserInfo) {
+            const userInfoResponse = await this.api.getUserInfo(senderID);
+            userInfo = userInfoResponse[senderID] || {};
+            Logger.debug('USER_CREATION', 'Retrieved user info from API', {
+              senderID,
+              name: userInfo.name
+            });
+          }
+        } catch (apiError) {
+          Logger.warn('USER_CREATION', 'Could not get user info from API', {
+            senderID,
+            error: apiError.message
+          });
+        }
+
+        // Create user with available data
+        const userData = {
+          name: userInfo.name ||
+            event.senderName ||
+            `User${senderID}`,
+          profileUrl: userInfo.profileUrl || '',
+          vanity: userInfo.vanity || '',
+          thumbSrc: userInfo.thumbSrc || ''
+        };
+
+        user = await this.database!.users.create(senderID, userData);
+
+        Logger.info('USER_CREATION', `Created new user: ${senderID}`, {
+          name: userData.name
+        });
+      }
+
+    } catch (error) {
+      Logger.error('USER_CREATION', `Failed to ensure user ${senderID}`, error);
+      // Don't throw for user creation failures - thread is more important
+    }
+  }
 
   private async loadScripts(): Promise<void> {
     const scriptsPath = path.join(process.cwd(), 'src', 'scripts');
-    
+
     // Load commands
     const commandsPath = path.join(scriptsPath, 'commands');
     if (await fs.pathExists(commandsPath)) {
@@ -183,14 +392,18 @@ export class UranusBot extends EventEmitter {
     for (const file of tsFiles) {
       try {
         const filePath = path.join(directory, file);
+
+        // Clear require cache for hot reload
         delete require.cache[require.resolve(filePath)];
-        
+
         const commandModule = require(filePath);
         const command: Command = commandModule.default || commandModule;
 
         if (this.validateCommand(command)) {
           this.commandManager.register(command);
           Logger.success('COMMAND', `Loaded: ${command.config.name}`);
+        } else {
+          Logger.warn('COMMAND', `Invalid command structure in ${file}`);
         }
       } catch (error) {
         Logger.error('COMMAND', `Failed to load ${file}`, error);
@@ -205,14 +418,18 @@ export class UranusBot extends EventEmitter {
     for (const file of tsFiles) {
       try {
         const filePath = path.join(directory, file);
+
+        // Clear require cache for hot reload
         delete require.cache[require.resolve(filePath)];
-        
+
         const eventModule = require(filePath);
         const event = eventModule.default || eventModule;
 
-        if (event.config && event.onStart) {
+        if (this.validateEvent(event)) {
           this.eventHandler.registerEvent(event);
           Logger.success('EVENT', `Loaded: ${event.config.name}`);
+        } else {
+          Logger.warn('EVENT', `Invalid event structure in ${file}`);
         }
       } catch (error) {
         Logger.error('EVENT', `Failed to load ${file}`, error);
@@ -221,19 +438,41 @@ export class UranusBot extends EventEmitter {
   }
 
   private validateCommand(command: Command): boolean {
-    if (!command.config) {
+    if (!command || !command.config) {
       Logger.error('COMMAND', 'Command missing config');
       return false;
     }
 
     const { name, description, category } = command.config;
     if (!name || !description || !category) {
-      Logger.error('COMMAND', 'Command missing required config fields');
+      Logger.error('COMMAND', 'Command missing required config fields (name, description, category)');
       return false;
     }
 
     if (typeof command.onStart !== 'function') {
-      Logger.error('COMMAND', 'Command missing onStart function');
+      Logger.error('COMMAND', `Command ${name} missing onStart function`);
+      return false;
+    }
+
+    return true;
+  }
+
+  // Fix: Add validateEvent method
+  private validateEvent(event: any): boolean {
+    if (!event || !event.config) {
+      Logger.error('EVENT', 'Event missing config');
+      return false;
+    }
+
+    const { name } = event.config;
+    if (!name) {
+      Logger.error('EVENT', 'Event missing name');
+      return false;
+    }
+
+    // Event should have at least one handler
+    if (!event.onChat && !event.onEvent && !event.onStart) {
+      Logger.error('EVENT', `Event ${name} missing handler functions`);
       return false;
     }
 
@@ -242,14 +481,14 @@ export class UranusBot extends EventEmitter {
 
   private setupAutoReload(): void {
     const scriptsPath = path.join(process.cwd(), 'src', 'scripts');
-    
+
     if (fs.existsSync(scriptsPath)) {
       fs.watch(scriptsPath, { recursive: true }, async (eventType, filename) => {
         if (!filename || !filename.endsWith('.ts')) return;
-        
+
         if (eventType === 'change') {
           Logger.info('AUTO_RELOAD', `Reloading ${filename}...`);
-          
+
           try {
             if (filename.includes('commands/')) {
               await this.reloadCommand(filename);
@@ -261,19 +500,19 @@ export class UranusBot extends EventEmitter {
           }
         }
       });
-      
+
       Logger.info('AUTO_RELOAD', 'Auto-reload enabled');
     }
   }
 
   private async reloadCommand(filename: string): Promise<void> {
     const commandPath = path.join(process.cwd(), 'src', 'scripts', filename);
-    
+
     if (await fs.pathExists(commandPath)) {
       delete require.cache[require.resolve(commandPath)];
       const commandModule = require(commandPath);
       const command: Command = commandModule.default || commandModule;
-      
+
       if (this.validateCommand(command)) {
         this.commandManager.register(command);
         Logger.success('AUTO_RELOAD', `Command ${command.config.name} reloaded`);
@@ -283,13 +522,13 @@ export class UranusBot extends EventEmitter {
 
   private async reloadEvent(filename: string): Promise<void> {
     const eventPath = path.join(process.cwd(), 'src', 'scripts', filename);
-    
+
     if (await fs.pathExists(eventPath)) {
       delete require.cache[require.resolve(eventPath)];
       const eventModule = require(eventPath);
       const event = eventModule.default || eventModule;
-      
-      if (event.config && event.onStart) {
+
+      if (this.validateEvent(event)) {
         this.eventHandler.registerEvent(event);
         Logger.success('AUTO_RELOAD', `Event ${event.config.name} reloaded`);
       }
@@ -298,15 +537,52 @@ export class UranusBot extends EventEmitter {
 
   async restart(): Promise<void> {
     Logger.info('RESTART', 'Restarting bot...');
-    
-    if (this.listening) {
-      this.api.stopListening();
-      this.listening = null;
+
+    try {
+      if (this.listening) {
+        this.api.logout(() => {
+          Logger.info('RESTART', 'Logged out successfully');
+        });
+        this.listening = null;
+      }
+    } catch (error) {
+      Logger.error('RESTART', 'Error during logout', error);
     }
 
     process.exit(2);
   }
 
+  // Fix: Add cleanup method
+  async cleanup(): Promise<void> {
+    Logger.info('CLEANUP', 'Cleaning up resources...');
+
+    try {
+      if (this.listening) {
+        this.api.stopListening();
+        this.listening = null;
+      }
+
+      // Cleanup command manager
+      this.commandManager.cleanup();
+
+      // Cleanup event handler
+      this.eventHandler.cleanup();
+
+      // Cleanup message factory
+      await MessageFactory.shutdown();
+
+      // Close database connections if needed
+      if (this.database && typeof (this.database as any).close === 'function') {
+        await (this.database as any).close();
+      }
+
+      Logger.info('CLEANUP', 'Cleanup completed');
+    } catch (error) {
+      Logger.error('CLEANUP', 'Error during cleanup', error);
+    }
+  }
+
+  // Getters
   getAPI(): any {
     return this.api;
   }
@@ -319,7 +595,11 @@ export class UranusBot extends EventEmitter {
     return this.commandManager;
   }
 
-  getDatabase(): DatabaseManager {
+  getEventHandler(): EventHandler {
+    return this.eventHandler;
+  }
+
+  getDatabase(): DatabaseManager | undefined {
     return this.database;
   }
 
@@ -329,5 +609,54 @@ export class UranusBot extends EventEmitter {
 
   getUptime(): number {
     return Date.now() - this.startTime;
+  }
+
+  isReady(): boolean {
+    return !!(this.api && this.botID && this.database);
+  }
+
+  // Health check method
+  getHealthStatus(): {
+    status: 'healthy' | 'degraded' | 'unhealthy';
+    details: {
+      api: boolean;
+      database: boolean;
+      listening: boolean;
+      uptime: number;
+    };
+  } {
+    const details = {
+      api: !!this.api,
+      database: !!this.database,
+      listening: !!this.listening,
+      uptime: this.getUptime()
+    };
+
+    let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
+
+    if (!details.api || !details.database) {
+      status = 'unhealthy';
+    } else if (!details.listening) {
+      status = 'degraded';
+    }
+
+    return { status, details };
+  }
+
+  // Get bot statistics
+  getStats(): {
+    uptime: number;
+    commands: number;
+    events: number;
+    threads: number;
+    users: number;
+  } {
+    return {
+      uptime: this.getUptime(),
+      commands: this.commandManager.getStats().totalCommands,
+      events: this.eventHandler.getEventCount(),
+      threads: 0, // Will be populated by database query if needed
+      users: 0    // Will be populated by database query if needed
+    };
   }
 }

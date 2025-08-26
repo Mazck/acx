@@ -204,6 +204,77 @@ class SQLiteUserDatabase extends BaseUserDatabase {
     });
   }
 
+  // Fix: Add missing methods
+  async addMoney(userID: string, amount: number): Promise<UserData> {
+    this.validateUserID(userID);
+    this.validateAmount(amount);
+    
+    return this.lock.with(`user:${userID}`, async () => {
+      return withBusyRetry(async () => {
+        return this.sequelize.transaction(
+          { type: Transaction.TYPES.IMMEDIATE },
+          async (t) => {
+            let row = await this.model.findByPk(userID, { transaction: t });
+            if (!row) {
+              row = (await this.model.create({
+                userID,
+                name: `User${userID}`,
+                exp: 0,
+                money: amount,
+                banned: {},
+                settings: {},
+                data: {},
+              }, { transaction: t }));
+            } else {
+              const currentMoney = (row.get('money') as number) || 0;
+              await row.update({ money: currentMoney + amount }, { transaction: t });
+            }
+            this.cache.add(String(userID));
+            return row.get({ plain: true }) as UserData;
+          }
+        );
+      });
+    });
+  }
+
+  async addExp(userID: string, amount: number): Promise<UserData> {
+    this.validateUserID(userID);
+    this.validateAmount(amount);
+    
+    return this.lock.with(`user:${userID}`, async () => {
+      return withBusyRetry(async () => {
+        return this.sequelize.transaction(
+          { type: Transaction.TYPES.IMMEDIATE },
+          async (t) => {
+            let row = await this.model.findByPk(userID, { transaction: t });
+            if (!row) {
+              row = (await this.model.create({
+                userID,
+                name: `User${userID}`,
+                exp: amount,
+                money: 0,
+                banned: {},
+                settings: {},
+                data: {},
+              }, { transaction: t }));
+            } else {
+              const currentExp = (row.get('exp') as number) || 0;
+              await row.update({ exp: currentExp + amount }, { transaction: t });
+            }
+            this.cache.add(String(userID));
+            return row.get({ plain: true }) as UserData;
+          }
+        );
+      });
+    });
+  }
+
+  async getName(userID: string): Promise<string> {
+    this.validateUserID(userID);
+    const row = await this.model.findByPk(userID, { raw: true });
+    return row ? (row as UserData).name : `User${userID}`;
+  }
+
   async getAll(): Promise<UserData[]> {
     const rows = await this.model.findAll({ raw: true });
     return rows as unknown as UserData[];
