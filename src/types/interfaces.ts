@@ -93,13 +93,18 @@ export interface UserData {
 export interface ThreadData {
   threadID: string;
   threadName: string;
+  avatarURL: string;
   adminIDs: string[];
   members: Member[];
+  nicknames: Record<string, string>;
   banned: BanInfo;
   settings: ThreadSettings;
   data: Record<string, any>;
   isGroup: boolean;
   isActive: boolean;
+  inviteLink?: any;
+  emoji?: any;
+  threadTheme?: any;
 }
 
 export interface Member {

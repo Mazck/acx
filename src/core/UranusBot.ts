@@ -300,11 +300,11 @@ export class UranusBot extends EventEmitter {
           });
         }
 
-        // Create thread with available data
         const threadData = {
           threadName: threadInfo.threadName ||
             event.threadName ||
-            `Thread${threadID}`,
+            `Thread ${threadID}`,
+          avatarURL: threadInfo.imageSrc || '',
           isGroup: event.isGroup,
           adminIDs: threadInfo.adminIDs ||
             event.adminIDs ||
@@ -315,6 +315,9 @@ export class UranusBot extends EventEmitter {
             inGroup: true,
             count: 0
           })) || [],
+          inviteLink: threadInfo.inviteLink || null,
+          emoji: threadInfo.emoji || null,
+          threadTheme: threadInfo.threadTheme || null,
           participantIDs: threadInfo.participantIDs ||
             event.participantIDs ||
             []

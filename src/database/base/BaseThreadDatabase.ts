@@ -28,8 +28,10 @@ export abstract class BaseThreadDatabase implements ThreadDatabase {
     return {
       threadID,
       threadName: threadInfo?.threadName || `Thread ${threadID}`,
+      avatarURL: threadInfo?.imageSrc || "",
       adminIDs: threadInfo?.adminIDs || [],
       members: threadInfo?.members || [],
+      nicknames: threadInfo?.nicknames || {},
       banned: {},
       settings: {
         sendWelcomeMessage: true,
@@ -38,7 +40,10 @@ export abstract class BaseThreadDatabase implements ThreadDatabase {
       },
       data: {},
       isGroup: threadInfo?.isGroup !== false,
-      isActive: false
+      isActive: false,
+      inviteLink: threadInfo?.inviteLink || null,
+      emoji: threadInfo?.emoji || null,
+      threadTheme: threadInfo?.threadTheme || null
     };
   }
 }

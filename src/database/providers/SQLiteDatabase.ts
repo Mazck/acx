@@ -80,13 +80,18 @@ class UserModel extends Model<UserData, UserCreation> implements UserData {
 type ThreadCreation = Optional<
   ThreadData,
   | "threadName"
+  | "avatarURL"
   | "adminIDs"
   | "members"
+  | "nicknames"
   | "banned"
   | "settings"
   | "data"
   | "isGroup"
   | "isActive"
+  | "inviteLink"
+  | "emoji"
+  | "threadTheme"
 >;
 class ThreadModel
   extends Model<ThreadData, ThreadCreation>
@@ -94,13 +99,18 @@ class ThreadModel
   // Remove public class fields to avoid shadowing Sequelize getters/setters
   declare threadID: string;
   declare threadName: string;
+  declare avatarURL: string;
   declare adminIDs: string[];
   declare members: any[];
+  declare nicknames: Record<string, string>;
   declare banned: Record<string, any>;
   declare settings: ThreadSettings;
   declare data: Record<string, any>;
   declare isGroup: boolean;
   declare isActive: boolean;
+  declare inviteLink?: any;
+  declare emoji?: any;
+  declare threadTheme?: any;
 }
 
 class GlobalModel extends Model {
@@ -315,8 +325,10 @@ class SQLiteThreadDatabase extends BaseThreadDatabase {
             const defaults: ThreadData = {
               threadID,
               threadName: threadInfo?.threadName || `Thread${threadID}`,
+              avatarURL: threadInfo?.imageSrc || "",
               adminIDs: threadInfo?.adminIDs || [],
               members: threadInfo?.members || [],
+              nicknames: threadInfo?.nicknames || {},
               banned: {},
               settings: {
                 sendWelcomeMessage: true,
@@ -326,6 +338,9 @@ class SQLiteThreadDatabase extends BaseThreadDatabase {
               data: {},
               isGroup: threadInfo?.isGroup !== false,
               isActive: false,
+              inviteLink: threadInfo?.inviteLink || null,
+              emoji: threadInfo?.emoji || null,
+              threadTheme: threadInfo?.threadTheme || null
             };
             const [row] = await this.model.findOrCreate({
               where: { threadID },
@@ -533,8 +548,10 @@ export class SQLiteDatabase implements DatabaseManager {
       {
         threadID: { type: DataTypes.STRING, primaryKey: true },
         threadName: { type: DataTypes.STRING, allowNull: false, defaultValue: "" },
+        avatarURL: { type: DataTypes.STRING, allowNull: false, defaultValue: "" },
         adminIDs: { type: DataTypes.JSON, allowNull: false, defaultValue: [] },
         members: { type: DataTypes.JSON, allowNull: false, defaultValue: [] },
+        nicknames: { type: DataTypes.JSON, allowNull: false, defaultValue: {} },
         banned: { type: DataTypes.JSON, allowNull: false, defaultValue: {} },
         settings: {
           type: DataTypes.JSON,
@@ -548,6 +565,9 @@ export class SQLiteDatabase implements DatabaseManager {
         data: { type: DataTypes.JSON, allowNull: false, defaultValue: {} },
         isGroup: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
         isActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+        inviteLink: { type: DataTypes.JSON, allowNull: true, defaultValue: null },
+        emoji: { type: DataTypes.STRING, allowNull: true, defaultValue: null },
+        threadTheme: { type: DataTypes.JSON, allowNull: true, defaultValue: null },
       },
       { sequelize: this.sequelize, tableName: "Threads", indexes: [{ unique: true, fields: ["threadID"] }] }
     );
