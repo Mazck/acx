@@ -74,7 +74,7 @@ export class EventHandler {
       // Handle chat events
       await this.handleChatEvents(context);
 
-    } catch (error) {
+    } catch (error: any) {
       Logger.error('EVENT_HANDLER', 'Error in handle method', {
         error: error.message,
         threadID: event.threadID,
@@ -279,7 +279,7 @@ export class EventHandler {
           }
         }
       }
-    } catch (error) {
+    } catch (error: any) {
       Logger.error('MESSAGE_HANDLER', 'Error handling message', {
         error: error.message,
         threadID: event.threadID,

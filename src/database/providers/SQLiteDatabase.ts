@@ -10,7 +10,7 @@ import {
 } from "sequelize";
 
 import { Logger } from "../../utils/Logger";
-import { DatabaseManager, UserData, ThreadData } from "../../types/interfaces";
+import { DatabaseManager, UserData, ThreadData, ThreadSettings } from "../../types/interfaces";
 import {
   BaseUserDatabase,
   BaseThreadDatabase,
@@ -60,20 +60,21 @@ async function withBusyRetry<T>(
 }
 
 /* =========================
- *  Sequelize Models
+ *  Sequelize Models (Fixed - No Public Class Fields)
  * ========================= */
 type UserCreation = Optional<
   UserData,
   "exp" | "money" | "banned" | "settings" | "data"
 >;
 class UserModel extends Model<UserData, UserCreation> implements UserData {
-  public userID!: string;
-  public name!: string;
-  public exp!: number;
-  public money!: number;
-  public banned!: Record<string, any>;
-  public settings!: Record<string, any>;
-  public data!: Record<string, any>;
+  // Remove public class fields to avoid shadowing Sequelize getters/setters
+  declare userID: string;
+  declare name: string;
+  declare exp: number;
+  declare money: number;
+  declare banned: Record<string, any>;
+  declare settings: Record<string, any>;
+  declare data: Record<string, any>;
 }
 
 type ThreadCreation = Optional<
@@ -90,20 +91,21 @@ type ThreadCreation = Optional<
 class ThreadModel
   extends Model<ThreadData, ThreadCreation>
   implements ThreadData {
-  public threadID!: string;
-  public threadName!: string;
-  public adminIDs!: string[];
-  public members!: any[];
-  public banned!: Record<string, any>;
-  public settings!: Record<string, any>;
-  public data!: Record<string, any>;
-  public isGroup!: boolean;
-  public isActive!: boolean;
+  // Remove public class fields to avoid shadowing Sequelize getters/setters
+  declare threadID: string;
+  declare threadName: string;
+  declare adminIDs: string[];
+  declare members: any[];
+  declare banned: Record<string, any>;
+  declare settings: ThreadSettings;
+  declare data: Record<string, any>;
+  declare isGroup: boolean;
+  declare isActive: boolean;
 }
 
 class GlobalModel extends Model {
-  public key!: string;
-  public data!: any;
+  declare key: string;
+  declare data: any;
 }
 
 /* =========================
@@ -149,7 +151,7 @@ class SQLiteUserDatabase extends BaseUserDatabase {
               transaction: t,
             });
             this.cache.add(String(userID));
-            return row.get({ plain: true }) as UserData;
+            return row.get({ plain: true }) as unknown as UserData;
           }
         );
       });
@@ -159,7 +161,7 @@ class SQLiteUserDatabase extends BaseUserDatabase {
   async get(userID: string, path?: string, defaultValue?: any): Promise<any> {
     const row = await this.model.findByPk(userID, { raw: true });
     if (!row) return defaultValue ?? null;
-    if (!path) return row as UserData;
+    if (!path) return row as unknown as UserData;
     const parts = path.split(".");
     let cur: any = row;
     for (const p of parts) {
@@ -180,7 +182,7 @@ class SQLiteUserDatabase extends BaseUserDatabase {
               await this.create(userID);
               return (await this.model.findByPk(userID, { transaction: t }))!.get(
                 { plain: true }
-              ) as UserData;
+              ) as unknown as UserData;
             }
             if (!path) {
               await row.update(data, { transaction: t });
@@ -197,18 +199,17 @@ class SQLiteUserDatabase extends BaseUserDatabase {
               await row.update(obj, { transaction: t });
             }
             this.cache.add(String(userID));
-            return row.get({ plain: true }) as UserData;
+            return row.get({ plain: true }) as unknown as UserData;
           }
         );
       });
     });
   }
 
-  // Fix: Add missing methods
   async addMoney(userID: string, amount: number): Promise<UserData> {
     this.validateUserID(userID);
     this.validateAmount(amount);
-    
+
     return this.lock.with(`user:${userID}`, async () => {
       return withBusyRetry(async () => {
         return this.sequelize.transaction(
@@ -230,7 +231,7 @@ class SQLiteUserDatabase extends BaseUserDatabase {
               await row.update({ money: currentMoney + amount }, { transaction: t });
             }
             this.cache.add(String(userID));
-            return row.get({ plain: true }) as UserData;
+            return row.get({ plain: true }) as unknown as UserData;
           }
         );
       });
@@ -240,7 +241,7 @@ class SQLiteUserDatabase extends BaseUserDatabase {
   async addExp(userID: string, amount: number): Promise<UserData> {
     this.validateUserID(userID);
     this.validateAmount(amount);
-    
+
     return this.lock.with(`user:${userID}`, async () => {
       return withBusyRetry(async () => {
         return this.sequelize.transaction(
@@ -262,7 +263,7 @@ class SQLiteUserDatabase extends BaseUserDatabase {
               await row.update({ exp: currentExp + amount }, { transaction: t });
             }
             this.cache.add(String(userID));
-            return row.get({ plain: true }) as UserData;
+            return row.get({ plain: true }) as unknown as UserData;
           }
         );
       });
@@ -272,7 +273,7 @@ class SQLiteUserDatabase extends BaseUserDatabase {
   async getName(userID: string): Promise<string> {
     this.validateUserID(userID);
     const row = await this.model.findByPk(userID, { raw: true });
-    return row ? (row as UserData).name : `User${userID}`;
+    return row ? (row as unknown as UserData).name : `User${userID}`;
   }
 
   async getAll(): Promise<UserData[]> {
@@ -332,7 +333,7 @@ class SQLiteThreadDatabase extends BaseThreadDatabase {
               transaction: t,
             });
             this.cache.add(String(threadID));
-            return row.get({ plain: true }) as ThreadData;
+            return row.get({ plain: true }) as unknown as ThreadData;
           }
         );
       });
@@ -342,7 +343,7 @@ class SQLiteThreadDatabase extends BaseThreadDatabase {
   async get(threadID: string, path?: string, defaultValue?: any): Promise<any> {
     const row = await this.model.findByPk(threadID, { raw: true });
     if (!row) return defaultValue ?? null;
-    if (!path) return row as ThreadData;
+    if (!path) return row as unknown as ThreadData;
     const parts = path.split(".");
     let cur: any = row;
     for (const p of parts) {
@@ -363,7 +364,7 @@ class SQLiteThreadDatabase extends BaseThreadDatabase {
               await this.create(threadID);
               return (await this.model.findByPk(threadID, { transaction: t }))!.get(
                 { plain: true }
-              ) as ThreadData;
+              ) as unknown as ThreadData;
             }
             if (!path) {
               await row.update(data, { transaction: t });
@@ -380,7 +381,7 @@ class SQLiteThreadDatabase extends BaseThreadDatabase {
               await row.update(obj, { transaction: t });
             }
             this.cache.add(String(threadID));
-            return row.get({ plain: true }) as ThreadData;
+            return row.get({ plain: true }) as unknown as ThreadData;
           }
         );
       });
@@ -390,7 +391,7 @@ class SQLiteThreadDatabase extends BaseThreadDatabase {
   async refreshInfo(threadID: string): Promise<ThreadData> {
     const row = await this.model.findByPk(threadID, { raw: true });
     if (!row) throw new Error(`Thread ${threadID} not found`);
-    return row as ThreadData;
+    return row as unknown as ThreadData;
   }
 
   async getAll(): Promise<ThreadData[]> {

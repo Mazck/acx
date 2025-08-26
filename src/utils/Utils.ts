@@ -27,6 +27,46 @@ export class Utils {
     return parts.join(' ') || '0s';
   }
 
+  static formatBytes(bytes: number, decimals: number = 2): string {
+    if (bytes === 0) return '0 Bytes';
+    if (bytes < 0) return 'Invalid size';
+
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB'];
+
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const size = parseFloat((bytes / Math.pow(k, i)).toFixed(dm));
+
+    return `${size} ${sizes[i]}`;
+  }
+
+  static createProgressBar(
+    current: number,
+    total: number,
+    width: number = 20,
+    style: 'classic' | 'modern' | 'dots' = 'classic'
+  ): string {
+    const percentage = Math.min(Math.max(current / total, 0), 1);
+    const filled = Math.floor(percentage * width);
+    const empty = width - filled;
+
+    let bar: string;
+
+    switch (style) {
+      case 'modern':
+        bar = `[${'▰'.repeat(filled)}${'▱'.repeat(empty)}]`;
+        break;
+      case 'dots':
+        bar = `[${'●'.repeat(filled)}${'○'.repeat(empty)}]`;
+        break;
+      default:
+        bar = `[${'█'.repeat(filled)}${'░'.repeat(empty)}]`;
+    }
+
+    return `${bar} ${Math.floor(percentage * 100)}%`;
+  }
+
   static randomString(length: number = 10): string {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     let result = '';
@@ -86,7 +126,7 @@ export class Utils {
         writer.on('finish', () => resolve(outputPath));
         writer.on('error', reject);
       });
-    } catch (error) {
+    } catch (error: any) {
       throw new Error(`Failed to download file: ${error.message}`);
     }
   }
@@ -104,7 +144,7 @@ export class Utils {
       }
 
       return response.data;
-    } catch (error) {
+    } catch (error: any) {
       throw new Error(`Failed to get stream from URL: ${error.message}`);
     }
   }
@@ -150,7 +190,7 @@ export class Utils {
       }
 
       return null;
-    } catch (error) {
+    } catch (error: any) {
       throw new Error(`Failed to find UID: ${error.message}`);
     }
   }
@@ -244,5 +284,143 @@ export class Utils {
 
   static removeHomeDir(fullPath: string): string {
     return fullPath.replace(process.cwd(), '');
+  }
+
+  static capitalize(str: string): string {
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  }
+
+  static stripHTML(html: string): string {
+    return html.replace(/<[^>]*>/g, '');
+  }
+
+  static slugify(text: string): string {
+    return text
+      .toLowerCase()
+      .replace(/[^\w ]+/g, '')
+      .replace(/ +/g, '-');
+  }
+
+  static getRandomElement<T>(array: T[]): T {
+    return array[Math.floor(Math.random() * array.length)];
+  }
+
+  static shuffleArray<T>(array: T[]): T[] {
+    const shuffled = [...array];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+  }
+
+  static clamp(num: number, min: number, max: number): number {
+    return Math.min(Math.max(num, min), max);
+  }
+
+  static roundToDecimal(num: number, decimals: number): number {
+    const factor = Math.pow(10, decimals);
+    return Math.round(num * factor) / factor;
+  }
+
+  static percentage(value: number, total: number): number {
+    return total === 0 ? 0 : (value / total) * 100;
+  }
+
+  static formatDuration(seconds: number): string {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+
+    const parts = [];
+    if (hours > 0) parts.push(`${hours}h`);
+    if (minutes > 0) parts.push(`${minutes}m`);
+    if (secs > 0 || parts.length === 0) parts.push(`${secs}s`);
+
+    return parts.join(' ');
+  }
+
+  static parseSize(sizeStr: string): number {
+    const units: Record<string, number> = {
+      'b': 1,
+      'kb': 1024,
+      'mb': 1024 ** 2,
+      'gb': 1024 ** 3,
+      'tb': 1024 ** 4
+    };
+
+    const match = sizeStr.toLowerCase().match(/^(\d+(?:\.\d+)?)\s*([a-z]+)?$/);
+    if (!match) return 0;
+
+    const value = parseFloat(match[1]);
+    const unit = match[2] || 'b';
+
+    return value * (units[unit] || 1);
+  }
+
+  static getTimeAgo(timestamp: number): string {
+    const now = Date.now();
+    const diff = now - timestamp;
+
+    const minute = 60 * 1000;
+    const hour = 60 * minute;
+    const day = 24 * hour;
+    const week = 7 * day;
+    const month = 30 * day;
+    const year = 365 * day;
+
+    if (diff < minute) return 'just now';
+    if (diff < hour) return `${Math.floor(diff / minute)}m ago`;
+    if (diff < day) return `${Math.floor(diff / hour)}h ago`;
+    if (diff < week) return `${Math.floor(diff / day)}d ago`;
+    if (diff < month) return `${Math.floor(diff / week)}w ago`;
+    if (diff < year) return `${Math.floor(diff / month)}mo ago`;
+    return `${Math.floor(diff / year)}y ago`;
+  }
+
+  static isValidEmail(email: string): boolean {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
+  }
+
+  static isValidPhone(phone: string): boolean {
+    const phoneRegex = /^[\+]?[\d\s\-\(\)]{10,15}$/;
+    return phoneRegex.test(phone);
+  }
+
+  static maskEmail(email: string): string {
+    const [user, domain] = email.split('@');
+    if (!user || !domain) return email;
+
+    const maskedUser = user.length <= 2
+      ? '*'.repeat(user.length)
+      : user[0] + '*'.repeat(user.length - 2) + user[user.length - 1];
+
+    return `${maskedUser}@${domain}`;
+  }
+
+  static maskPhone(phone: string): string {
+    const cleaned = phone.replace(/\D/g, '');
+    if (cleaned.length < 4) return phone;
+
+    const start = cleaned.slice(0, 3);
+    const end = cleaned.slice(-2);
+    const middle = '*'.repeat(cleaned.length - 5);
+
+    return `${start}${middle}${end}`;
+  }
+
+  static colorizeText(text: string, color: 'red' | 'green' | 'blue' | 'yellow' | 'magenta' | 'cyan'): string {
+    const colors: Record<string, string> = {
+      red: '\x1b[31m',
+      green: '\x1b[32m',
+      blue: '\x1b[34m',
+      yellow: '\x1b[33m',
+      magenta: '\x1b[35m',
+      cyan: '\x1b[36m'
+    };
+
+    const reset = '\x1b[0m';
+    return `${colors[color] || ''}${text}${reset}`;
   }
 }

@@ -164,7 +164,7 @@ export class CommandManager {
       );
 
       return true;
-    } catch (error) {
+    } catch (error: any) {
       Logger.error('COMMAND', `Error executing ${command.config.name}`, {
         error: error.message,
         stack: error.stack?.split('\n').slice(0, 3).join('\n'),

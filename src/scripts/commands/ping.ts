@@ -18,7 +18,7 @@ const pingCommand: Command = {
     const startTime = Date.now();
     
     // Send initial message
-    const sentMessage = await message.reply('🏓 Pinging...');
+     await message.reply('🏓 Pinging...');
     
     const endTime = Date.now();
     const latency = endTime - startTime;
@@ -41,7 +41,7 @@ const pingCommand: Command = {
       `• Environment: ${process.env.NODE_ENV || 'production'}`;
 
     // Edit the original message
-    await api.editMessage(responseText, sentMessage.messageID);
+    await message.reply(responseText);
   },
 
   onChat: async ({ event, message }: MessageContext) => {

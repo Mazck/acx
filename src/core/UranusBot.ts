@@ -24,14 +24,33 @@ export class UranusBot extends EventEmitter {
     this.startTime = Date.now();
     this.commandManager = new CommandManager();
     this.eventHandler = new EventHandler(this);
+
+    // Set global bot instance for commands to access
+    (global as any).bot = this;
   }
 
   async initialize(): Promise<void> {
     Logger.banner();
     Logger.info('INIT', 'Initializing Uranus Bot...');
 
-    // Initialize database
-    this.database = await DatabaseFactory.create(this.config.database);
+    // Initialize database with proper configuration mapping
+    const dbConfig = this.config.database;
+
+    // Map the BotConfig.database to DatabaseFactory expected format
+    if (dbConfig.type === 'sqlite') {
+      this.database = await DatabaseFactory.create({
+        kind: 'sqlite',
+        storage: dbConfig.path || './data/database.sqlite'
+      });
+    } else {
+      // Default to SQLite if unsupported type
+      Logger.warn('DATABASE', `Unsupported database type: ${dbConfig.type}, falling back to SQLite`);
+      this.database = await DatabaseFactory.create({
+        kind: 'sqlite',
+        storage: dbConfig.path || './data/database.sqlite'
+      });
+    }
+
     Logger.success('DATABASE', 'Database connection established');
 
     // Load commands and events
@@ -246,7 +265,7 @@ export class UranusBot extends EventEmitter {
         await this.ensureUserExists(senderID, event);
       }
 
-    } catch (error) {
+    } catch (error: any) {
       Logger.error('EVENT', 'Error in ensureDataExists', {
         error: error.message,
         threadID,
@@ -274,7 +293,7 @@ export class UranusBot extends EventEmitter {
               threadName: threadInfo.threadName
             });
           }
-        } catch (apiError) {
+        } catch (apiError: any) {
           Logger.warn('THREAD_CREATION', 'Could not get thread info from API', {
             threadID,
             error: apiError.message
@@ -339,7 +358,7 @@ export class UranusBot extends EventEmitter {
               name: userInfo.name
             });
           }
-        } catch (apiError) {
+        } catch (apiError: any) {
           Logger.warn('USER_CREATION', 'Could not get user info from API', {
             senderID,
             error: apiError.message
